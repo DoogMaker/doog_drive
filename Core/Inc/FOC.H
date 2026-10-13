@@ -88,6 +88,9 @@ typedef struct {
 	float Vd_norm, Vq_norm;				 // 归一化电压指令
 	float openloop_angle;            // 开环模式下独立累加的电角度 (rad)
     float openloop_voltage;          // 开环模式下手动给定的电压幅值 (V)
+    uint8_t openloop_hold;           // 1 = 开环保持（电弹簧）：冻结 openloop_angle，改用 Vd 通电保持力矩，
+                                     //     与 ALIGN 磁力定位同形态；0 = 正常开环（角度按 target_speed_ramp 积分）
+                                     //     所有 FOC_SetMode 调用都会清零本标志（含 CAN/串口/启动序列）
 	  FOC_State_t mode;		// 当前工作状态
     FOC_ClosedLoopMode_t closedloop_mode;   // 闭环级联深度（力矩/速度/位置）
     // 位置环字段（减速器输出端位置，单位 rad，Encoder2_Angle_Multiturn 范围）

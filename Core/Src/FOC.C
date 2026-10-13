@@ -161,6 +161,7 @@ void FOC_Init(void)
 	foc.openloop_voltage_ramp = 0.0f;
 	foc.target_Iq = 0.0f;
 	foc.openloop_angle = 0.0f;
+	foc.openloop_hold = 0;          // 开环保持（电弹簧）默认关闭
 	foc.Vd = 0.0f;
 	foc.Vq = 0.0f;
 	
@@ -314,7 +315,11 @@ void FOC_Update(void)
 	// 开环电压斜坡：仅开环分支使用，闭环下恒等于给定值（无影响）
 	{
     	float v_cmd = foc.openloop_voltage;                    // 用户设定的上限
-    	if (v_cmd > 0.0f) {
+    	if (foc.openloop_hold) {
+       		// 电弹簧保持：零速下 V/f 只给到 FOC_VOLT_BOOST(0.2V)，力矩不足，
+       		// 故保持阶段直接用给定电压，保证"保持一定力矩"可调。
+        	foc.openloop_voltage_ramp = v_cmd;
+    	} else if (v_cmd > 0.0f) {
        		// 目标励磁 = boost + V/f×转速，但不超过用户设定
         	float v_vf = FOC_VOLT_BOOST + FOC_VF_GAIN * fabsf(foc.target_speed_ramp);
         	if (v_vf > v_cmd) v_vf = v_cmd;
@@ -407,6 +412,16 @@ void FOC_Update(void)
 	    break;
     
 		case FOC_STATE_OPENLOOP:// 开环模式
+			if (foc.openloop_hold) {
+				// ---- 电弹簧保持：冻结电角度 + d 轴通电（与 ALIGN 磁力定位同形态）----
+				// 平衡点 = openloop_angle（到位时已对齐到转子电角度），偏离即产生回复力矩，
+				// 稳定吸引域约 ±180 电角度 ≈ ±8.6° 电机轴机械角（极对数 21 → 电周期 17.14°）；
+				// 更大的偏离由命令层用电机轴编码器检测后重新走开环回拉。
+				foc.angle = foc.openloop_angle;
+				foc.Vd = foc.openloop_voltage_ramp;
+				foc.Vq = 0.0f;
+				break;
+			}
 			// 电角度由斜坡后的目标速度积分累加
 			foc.openloop_angle += foc.target_speed_ramp  * MOTOR_POLE_PAIRS * control_dt;
 			// 角度归一化到 0~2π
@@ -533,6 +548,10 @@ void FOC_Update(void)
 // 切换 FOC 控制模式
 void FOC_SetMode(FOC_State_t mode)
 {
+	// 任意模式切换（含串口 mode=/ang=、CAN、启动序列）都退出开环保持，
+	// 避免电弹簧状态残留在后续模式里造成意外通电；放在提前返回前，保证同一模式的重复调用也生效。
+	foc.openloop_hold = 0;
+
 	if (foc.mode == mode) return;
 
 	// 重置所有 PID 积分，避免模式切换时输出突变
