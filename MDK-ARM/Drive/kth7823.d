@@ -31,6 +31,6 @@ drive/kth7823.o: ..\Core\Src\KTH7823.c ..\Core\Inc\kth7823.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_tim_ex.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
-  ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
+  ..\Core\Inc\main.h ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
   ..\Drivers\CMSIS\Include\cmsis_compiler.h ..\Core\Inc\spi.h \
-  ..\Core\Inc\main.h ..\Core\Inc\dwt_delay.h
+  ..\Core\Inc\dwt_delay.h

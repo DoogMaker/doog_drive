@@ -36,6 +36,8 @@ extern UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN Private defines */
 
+extern DMA_HandleTypeDef hdma_usart3_rx;   // RX DMA 句柄（定义于 usart.c，供 DMA1_Channel4 中断使用）
+
 /* USER CODE END Private defines */
 
 void MX_USART3_UART_Init(void);

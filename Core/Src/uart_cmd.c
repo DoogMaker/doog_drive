@@ -6,6 +6,7 @@
 #include "kth7823.h"
 #include "Protect.h"
 #include "fdcan_app.h"  
+#include "fdcan.h"       // hfdcan2（串口 can 诊断命令读外设状态/错误计数）
 #include "dwt_delay.h"   // [TEST] DWT_DelayMs（开环角度运动阻塞延时）
 #include "iwdg.h"        // [TEST] HAL_IWDG_Refresh / hiwdg
 #include <string.h>
@@ -24,24 +25,37 @@ extern volatile float KTH7823_Angle_Rad;
 extern volatile float KTH7823_Speed_Rads;
 extern float KTH7823_Speed_RPM;
 
-/* ==================== 串口接收缓冲（中断独占 + 双缓冲交付）====================
- * 并发约定（必须严格遵守，否则会丢字符/丢命令）：
- *   - rx_buf / rx_index / rx_overflow 只由接收中断（HAL_UART_RxCpltCallback）读写，
- *     主循环绝不触碰。旧实现主循环会重置 rx_index 并 memset(rx_buf)，会把刚收到的
- *     下一行首字节清零 -> 命令丢首字母 -> Unknown command；抹掉行尾则永远等不到
- *     终止符 -> 命令无任何回显，直到与下一行合并成垃圾命令。
- *   - 一行收满（'\n' 或 '\r'）后由中断整体拷进 cmd_line 并置 cmd_ready；
- *     cmd_ready=1 期间中断不改写 cmd_line，主循环拷完再清标志：
- *     命令不会被撕开，主循环也无需再挂接收中断。
- *   - HAL_UART_Receive_IT 的目标恒为 &rx_buf[rx_index]，回调读 rx_buf[rx_index]，
- *     两者由同一个 owner 维护，永远一致。
- *   - 上一行未被主循环取走时，中断整行丢弃新到的一行（不覆盖）。
+/* ==================== 串口接收缓冲（RX DMA 循环 + IDLE 事件 + 双缓冲交付）====================
+ * 为什么必须从"单字节中断"换成 DMA 接收：
+ *   旧实现是 HAL_UART_Receive_IT(&huart3, &rx_buf[rx_index], 1)，每个字节进一次中断。
+ *   但 USART3 的抢占优先级是最低的(3)，只要没能在"一个字节时间"（115200 下 87µs）内被服务，
+ *   接收寄存器就溢出(ORE)：HAL 会中止接收并丢掉半行，剩下的残行随后被当成一条新命令
+ *   -> 现象就是"偶发 Unknown command / 整行没有任何回显、看起来像串口死掉"。
+ *   系统里吃掉这段时间的来源很多：TIM1(20kHz) 与 TIM3(10kHz，内含阻塞 SPI 读编码器) 中断、
+ *   UART_SendString 拷贝大数据时的关中断窗口、以及离开 IDLE（开环/闭环）后中断负载与
+ *   PWM 开关带来的上升。所以"连发 status 没事、一发 mode=1 就乱"是非常典型的 ORE 表现。
+ *   现在：RX 由 DMA 循环缓冲搬运，CPU 只在"总线空闲(IDLE)"或缓冲半满/全满时进一次中断，
+ *   任意长的中断延迟都不会丢字节；行解析逻辑与旧实现完全一致（'\r' 与 '\n' 都当行尾）。
+ *
+ * 并发约定：
+ *   - rx_dma_buf 由 DMA 硬件写，CPU 只读已到达区间；rx_dma_pos 是"已消费位置"，
+ *     只由 RxEvent 回调（USART3 IRQ 或 DMA1_Channel4 IRQ，两者同优先级、不会互相嵌套）读写。
+ *   - rx_buf / rx_index / rx_overflow 同样只由 RxEvent 回调读写，主循环绝不触碰。
+ *   - 一行收满（'\n' 或 '\r'）后整体拷进 cmd_line 并置 cmd_ready；cmd_ready=1 期间
+ *     回调不改写 cmd_line，主循环拷完再清标志：命令不会被撕开。
+ *   - 上一行未被主循环取走时，整行丢弃新到的一行（不覆盖）：宁可丢一条命令，
+ *     也不会把两行拼成垃圾命令去执行。
  */
 #define UART_RX_BUF_SIZE  64
-static  char rx_buf[UART_RX_BUF_SIZE];       // 中断正在组装的行（中断独占）
-static  uint8_t rx_index = 0;                // 组装位置（中断独占）
-static  uint8_t rx_overflow = 0;             // 1 = 本行超长，丢弃到行尾（中断独占）
-static  char cmd_line[UART_RX_BUF_SIZE];     // 中断交付的完整命令行
+#define UART_RX_DMA_SIZE  256u                    // RX DMA 循环缓冲，必须是 2 的幂
+#define UART_RX_DMA_MASK  (UART_RX_DMA_SIZE - 1u)
+
+static  uint8_t rx_dma_buf[UART_RX_DMA_SIZE];    // DMA 循环写入的接收缓冲
+static  volatile uint16_t rx_dma_pos = 0;        // 已消费到的位置（0..UART_RX_DMA_SIZE）
+static  char rx_buf[UART_RX_BUF_SIZE];       // 正在组装的行（回调独占）
+static  uint8_t rx_index = 0;                // 组装位置（回调独占）
+static  uint8_t rx_overflow = 0;             // 1 = 本行超长，丢弃到行尾（回调独占）
+static  char cmd_line[UART_RX_BUF_SIZE];     // 交付给主循环的完整命令行
 static  volatile uint8_t cmd_ready = 0;      // 1 = cmd_line 中有完整命令待主循环处理
 
 /* ==================== 非阻塞发送缓冲（TX 环形缓冲 + DMA 发送）====================
@@ -85,6 +99,7 @@ static const char* help_msg =
     "mode=<0..5>    - Set control mode (0:IDLE 1:OPENLOOP 2:SPEED 3:ALIGN 4:POSITION 5:TORQUE)\r\n"
     "dir=<0|1>      - Set direction (0:forward, 1:reverse)\r\n"
     "status         - Print current status (Mode uses mode= numbering: 6=FAULT)\r\n"
+    "can            - Print CAN(FDCAN2) live diagnostics (state/errors/RX/TX/last frame)\r\n"
     "log=<0|1>      - Auto report realtime status every 200ms (Ia/Ib/Ic, Vbus, temp, speed, mode)\r\n"
     "pid            - Print all PID gains (Kp/Ki/Kd)\r\n"
     "pid <ring> <Kp> <Ki> <Kd> - Set PID (ring: speed|id|iq|pos)\r\n"
@@ -94,48 +109,69 @@ static const char* help_msg =
     "                 hold on as electric spring (encoder pull-back) 3s then release\r\n"
     "==============================================\r\n";
 
+static void UART_Rx_Start(void);   // 启动/重启 RX DMA 接收（见下）
+
 //串口命令处理初始化
 void UART_Cmd_Init(void)
 {
     // 清空缓冲区
     memset(rx_buf, 0, UART_RX_BUF_SIZE);
     memset(cmd_line, 0, UART_RX_BUF_SIZE);
-    rx_index    = 0;
-    rx_overflow = 0;
     cmd_ready   = 0;
 
-    // 启动串口接收中断（单字节中断，接收缓冲由中断独占维护）
-    HAL_UART_Receive_IT(&huart3, (uint8_t*)rx_buf, 1);
+    // 启动接收：RX DMA 循环缓冲 + IDLE 事件（DMA 永不停，回调见 HAL_UARTEx_RxEventCallback）
+    UART_Rx_Start();
 }
 
-//串口接收完成回调（由 HAL 库调用）每次收到一个字符都会进入
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+// 启动/重启 RX 接收（DMA 循环 + IDLE 事件）。
+// DMA 从缓冲下标 0 重新开始写，故消费位置同时归零，两者保持一致。
+static void UART_Rx_Start(void)
+{
+    rx_index    = 0;
+    rx_overflow = 0;
+    rx_dma_pos  = 0;
+    (void)HAL_UARTEx_ReceiveToIdle_DMA(&huart3, rx_dma_buf, UART_RX_DMA_SIZE);
+}
+
+// 把一个已收到的字节喂给行组装器（逐字节逻辑与旧实现完全一致，只换数据来源）。
+// '\n' 与 '\r' 都当作行结束符：兼容 CRLF / 仅 LF / 仅 CR 三种上位机行尾。
+static void UART_Rx_FeedByte(char c)
+{
+    if (c == '\n' || c == '\r') {
+        if (!rx_overflow && rx_index > 0 && !cmd_ready) {
+            rx_buf[rx_index] = '\0';
+            memcpy(cmd_line, rx_buf, (size_t)rx_index + 1u);
+            cmd_ready = 1;      // 上一行未被主循环取走时，整行丢弃本行，绝不覆盖
+        }
+        rx_index    = 0;        // 重置，准备接收下一条命令
+        rx_overflow = 0;
+    } else {
+        // 普通字符：先落进组装缓冲再推进下标。
+        // （旧单字节中断版本里 HAL 已把字节直接写进 rx_buf[rx_index]，回调只管推下标；
+        //   换成 DMA 后字节在 rx_dma_buf 里，必须在这里自己写入，否则交付的是全 0 空行。）
+        rx_buf[rx_index] = c;
+        rx_index++;
+        if (rx_index >= UART_RX_BUF_SIZE - 1) {
+            rx_overflow = 1;    // 超长：整行丢弃到行尾，不再把半行当命令解析
+            rx_index    = 0;
+            UART_SendString("\r\nError: Command too long!\r\n");
+        }
+    }
+}
+
+/* RX 事件回调（IDLE / 半满 / 全满三种事件都会进来）：
+ *   Size = 本次事件时的 DMA 写入位置。循环缓冲下它等价于"累计写入字节数 mod 缓冲大小"，
+ *          因此可以安全地做环形推进（回绕时 Size 会从 UART_RX_DMA_SIZE 变成 0 或小值）。
+ *   处理：把 [rx_dma_pos, Size) 区间内新到达的字节按顺序喂给行组装器。
+ *   中断上下文：只用定长拷贝与 memcpy，不做浮点格式化（与旧单字节中断的负担相当）。 */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == USART3) {
-        // 收到的字节位于本次挂载的目标地址 &rx_buf[rx_index]，与 rx_index 恒一致
-        char c = rx_buf[rx_index];
-
-        // '\n' 与 '\r' 都当作行结束符：兼容 CRLF / 仅 LF / 仅 CR 三种上位机行尾。
-        // （旧实现忽略 '\r' 只认 '\n'：上位机若只发 CR，命令永远不触发 -> 无任何回显）
-        if (c == '\n' || c == '\r') {
-            if (!rx_overflow && rx_index > 0 && !cmd_ready) {
-                rx_buf[rx_index] = '\0';
-                memcpy(cmd_line, rx_buf, (size_t)rx_index + 1u);
-                cmd_ready = 1;      // 上一行未被主循环取走时，整行丢弃本行，绝不覆盖
-            }
-            rx_index    = 0;        // 重置，准备接收下一条命令
-            rx_overflow = 0;
-        } else {
-            // 普通字符，继续接收
-            rx_index++;
-            if (rx_index >= UART_RX_BUF_SIZE - 1) {
-                rx_overflow = 1;    // 超长：整行丢弃到行尾，不再把半行当命令解析
-                rx_index    = 0;
-                UART_SendString("\r\nError: Command too long!\r\n");
-            }
+        uint16_t pos = (uint16_t)(Size & UART_RX_DMA_MASK);
+        while (rx_dma_pos != pos) {
+            UART_Rx_FeedByte((char)rx_dma_buf[rx_dma_pos]);
+            rx_dma_pos = (uint16_t)((rx_dma_pos + 1u) & UART_RX_DMA_MASK);
         }
-        // 继续接收下一个字符（接收中断是 rx_buf/rx_index 的唯一 owner）
-        HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_buf[rx_index], 1);
     }
 }
 
@@ -235,9 +271,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
     UART_SendString("Hold on (electric spring)...\r\n");
 
     while ((HAL_GetTick() - t_hold) < TEST_OL_HOLD_MS) {
-        // 阻塞期间必须维持的节奏：编码器刷新（否则 10ms 不刷新触发 ENCODER_STALL）、喂狗、发串口
-        KTH7823_UpdateAngle();
-        KTH7823_UpdateSpeed();
+        // 阻塞期间必须维持的节奏：喂狗、发串口（编码器刷新已由 TIM3 中断独立完成）
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);
 
@@ -254,8 +288,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
 
             uint32_t t_pull = HAL_GetTick();
             while ((HAL_GetTick() - t_pull) < TEST_OL_HOLD_PULL_TIMEOUT_MS) {
-                KTH7823_UpdateAngle();
-                KTH7823_UpdateSpeed();
+                // 编码器刷新由 TIM3 中断独立完成，此处只喂狗/发串口
                 UART_Tx_Poll();
                 HAL_IWDG_Refresh(&hiwdg);
 
@@ -329,8 +362,7 @@ int UART_Test_OpenLoopMoveAngle(float out_deg)
         last_tick = now;
         moved += foc.target_speed_ramp * (float)MOTOR_POLE_PAIRS * control_dt * (float)dt_ticks;
 
-        KTH7823_UpdateAngle();     // 维持编码器/失速检测节奏（开环不用其值判位）
-        KTH7823_UpdateSpeed();
+        // 编码器刷新由 TIM3 中断独立完成（开环不用其值判位），此处只喂狗/发串口
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);  // 阻塞期间喂狗，防 IWDG 复位
         if ((HAL_GetTick() - t0) > TEST_OL_MOVE_TIMEOUT_MS) break;
@@ -613,7 +645,70 @@ void UART_Cmd_Process(void)
         UART_SendString("DRV8353 output disabled\r\n");
         return;
     }
-    
+
+    // ==================== can - 打印 CAN(FDCAN2) 实时诊断（只读，不改变任何状态）====================
+    // 排查用法（配合 CAN 联调）：
+    //   RX(node)=0                 -> 下位机一帧都没收到：查帧 ID(0x100+NODE_ID)、1Mbps、标准帧/经典帧、
+    //                                 DLC=8、接线与两端 120Ω 终端、收发器供电/使能
+    //   RX(node) 在涨但电机没反应  -> 帧收到了：看 armed（=1 时 20ms 无帧就会 COMM_TIMEOUT）与 ErrFlags
+    //   RX/TX 都在涨且 TEC/REC=0   -> 链路正常，问题在上位机侧解析（ID/字段/门控顺序）
+    // 注：TEC/REC 与 LEC 直接读寄存器（缓存值只在 EW/EP/BO 跳变时更新，不能反映当前状态）；
+    //     读 PS 会清掉 LEC 锁存，所以每次 can 看到的是"上次读取以来的最后一次总线错误"。
+    if (strcmp(cmd_buf, "can") == 0) {
+        FDCAN_ErrorCountersTypeDef  ec;
+        FDCAN_ProtocolStatusTypeDef ps;
+        const char *st;
+
+        switch (hfdcan2.State) {
+            case HAL_FDCAN_STATE_RESET: st = "RESET";   break;   // 未初始化/已关闭
+            case HAL_FDCAN_STATE_READY: st = "READY";   break;   // 已初始化但未 Start
+            case HAL_FDCAN_STATE_BUSY:  st = "BUSY";    break;   // 唯一的正常收发态
+            case HAL_FDCAN_STATE_ERROR: st = "ERROR";   break;   // 外设异常（BusOff 恢复失败会落到这里）
+            default:                    st = "UNKNOWN"; break;
+        }
+
+        (void)HAL_FDCAN_GetErrorCounters(&hfdcan2, &ec);
+        (void)HAL_FDCAN_GetProtocolStatus(&hfdcan2, &ps);
+
+        sprintf(response,
+                "CAN node=%d CMD_ID=0x%03X FBK_ID=0x%03X | State=%s ErrorCode=0x%08lX\r\n"
+                "TEC=%u REC=%u | PS: Act=%lu LEC=%lu DLEC=%lu Warning=%lu ErrPassive=%lu BusOff=%lu\r\n"
+                "ErrFlags=0x%02lX (EW=%d EP=%d BO=%d) | BusOffCnt=%lu ProtoErrCnt=%lu\r\n",
+                NODE_ID, (unsigned)CMD_FRAME_ID, (unsigned)FBK_FRAME_ID,
+                st, (unsigned long)hfdcan2.ErrorCode,
+                (unsigned)ec.TxErrorCnt, (unsigned)ec.RxErrorCnt,
+                (unsigned long)ps.Activity, (unsigned long)ps.LastErrorCode,
+                (unsigned long)ps.DataLastErrorCode, (unsigned long)ps.Warning,
+                (unsigned long)ps.ErrorPassive, (unsigned long)ps.BusOff,
+                (unsigned long)fdcan_error_flags,
+                (fdcan_error_flags & FDCAN_ERR_FLAG_WARNING) ? 1 : 0,
+                (fdcan_error_flags & FDCAN_ERR_FLAG_PASSIVE) ? 1 : 0,
+                (fdcan_error_flags & FDCAN_ERR_FLAG_BUSOFF)  ? 1 : 0,
+                (unsigned long)fdcan_busoff_count, (unsigned long)fdcan_proto_err);
+        UART_SendString(response);
+
+        sprintf(response,
+                "RX(node)=%lu RX(otherID)=%lu RX(queueFull)=%lu TX=%lu TXfail=%lu | Comm rx_count=%lu armed=%d\r\n"
+                "LastRX: ID=0x%03lX DLC=%u Data=%02X %02X %02X %02X %02X %02X %02X %02X t=%lums\r\n",
+                (unsigned long)fdcan_rx_count, (unsigned long)fdcan_rx_otherid_count,
+                (unsigned long)fdcan_rx_drop_count, (unsigned long)fdcan_tx_count,
+                (unsigned long)fdcan_tx_fail_count,
+                (unsigned long)comm_rx_count, (int)Protect_CommIsArmed(),
+                (unsigned long)fdcan_last_rx_id, (unsigned)fdcan_last_rx_dlc,
+                (unsigned)fdcan_last_rx_data[0], (unsigned)fdcan_last_rx_data[1],
+                (unsigned)fdcan_last_rx_data[2], (unsigned)fdcan_last_rx_data[3],
+                (unsigned)fdcan_last_rx_data[4], (unsigned)fdcan_last_rx_data[5],
+                (unsigned)fdcan_last_rx_data[6], (unsigned)fdcan_last_rx_data[7],
+                (unsigned long)fdcan_last_rx_ms);
+        UART_SendString(response);
+
+        if (!fdcan_last_rx_valid) {
+            UART_SendString("Note: no command frame received yet -> check frame ID (0x100+NODE_ID), "
+                            "1Mbps, standard/classic frame, DLC=8, wiring & 120ohm terminator\r\n");
+        }
+        return;
+    }
+
     // 未知命令
     UART_SendString("Unknown command. Type 'help' for available commands.\r\n");
 }
@@ -705,7 +800,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
-// 串口出错回调：释放发送状态，并在接收被中止时重新挂上接收中断
+// 串口出错回调：释放发送状态，并在接收被中止时重新挂上 RX DMA 接收
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3) {
@@ -714,13 +809,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         tx_chunk  = 0;
         tx_active = 0;
 
-        // 接收侧：过载(ORE)等错误会让 HAL 中止接收，这里重新挂上，避免命令通道永久失效。
-        // 出错时本行至少丢了一个字节，已不可信：丢弃当前半行，防止它与后续命令拼成
-        // 一条垃圾命令（旧行为会继续在残行上拼接，正是 Unknown command 的来源之一）。
+        // 接收侧：ORE 等"阻塞性"错误会让 HAL 中止 DMA 接收并把 RxState 置回 READY，
+        // 此处重新启动接收，避免命令通道永久失效（非阻塞性错误如帧/噪声错误时
+        // RxState 仍为 BUSY_RX，ReceiveToIdle_DMA 会返回 HAL_BUSY，天然不会重复启动）。
+        // 重启即从缓冲下标 0 重新开始，半行残数据随之丢弃，不会与后续命令拼成垃圾命令。
         if (huart->RxState == HAL_UART_STATE_READY) {
-            rx_index    = 0;
-            rx_overflow = 0;
-            HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_buf[rx_index], 1);
+            UART_Rx_Start();
         }
     }
 }

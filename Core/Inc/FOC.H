@@ -43,6 +43,25 @@
 #define FOC_VF_GAIN     0.0725f   // V/(rad/s)，≈ 额定 V/f
 #define FOC_VOLT_BOOST  0.2f     // 低速升压 (V)，克服 R 压降/静摩擦
 
+// ==================== 开环"转到指定输出端角度 + 到位悬停保持"参数 ====================
+// CAN 0x07：按当前开环方式转到指定减速器输出端角度，到位后进入"电弹簧"悬停保持。
+// 悬停**不计时自动释放**，会一直保持，直到满足以下任一释放条件（释放后电压、速度归零）：
+//   ① 上位机发送 0x02 且电压为 0（v=0）——显式释放；
+//   ② 离开开环模式（0x03 切模式、保护停机）——自动中止并释放。
+// 完整说明见 docs/CAN上位机控制指令说明.md。
+#define GEAR_RATIO_OUT2MOTOR        12.5f   // 减速器输出端 -> 电机轴 的减速比
+#define FOC_OL_DEFAULT_SPEED        5.0f    // 未设转速时的默认开环转速 (rad/s，电机轴)
+#define FOC_OL_DEFAULT_VOLTAGE      0.6f    // 未设电压时的默认开环电压 (V)
+#define FOC_OL_MOVE_TIMEOUT_MS      5000    // 运动阶段超时 (ms)：未转够则直接断电释放
+#define FOC_OL_HOLD_VOLTAGE_MAX     0.6f    // 悬停/回拉电压上限 (V)：d 轴持续通电，越大保持力矩越强、发热越大
+#define FOC_OL_HOLD_BAND_DEG        10.0f   // 偏差死区 (±deg，电机轴)：超出即触发编码器回拉
+#define FOC_OL_HOLD_HYST_DEG        3.0f    // 回拉滞环 (±deg，电机轴)：回到该范围内即重新冻结保持
+#define FOC_OL_HOLD_PULL_SPEED      3.0f    // 回拉速度 (rad/s，电机轴)：低速，避免越过到位点
+#define FOC_OL_HOLD_PULL_TIMEOUT_MS 1000    // 单次回拉最长耗时 (ms)
+#define FOC_OL_DEG2RAD              0.01745329252f   // 度 -> rad（不依赖 PI 宏，避免头文件依赖差异）
+#define FOC_OL_RAD2DEG              57.29577951308f  // rad -> 度
+#define FOC_OL_TWO_PI               6.28318530718f   // 2π
+
 // FOC状态机
 typedef enum {
     FOC_STATE_IDLE,
@@ -60,6 +79,14 @@ typedef enum {
     CL_MODE_SPEED    = 1,  // 速度环（中层注入）：目标速度直接给定，速度环→电流环
     CL_MODE_POSITION = 2,  // 位置环（最外层注入）：位置环→速度环→电流环 全链路级联
 } FOC_ClosedLoopMode_t;
+
+// 开环"运动/悬停保持"子状态（FOC_State.openloop_move_state，也直接作为 0x300 状态帧 byte0）
+typedef enum {
+    FOC_OL_MOVE_IDLE = 0,   // 非活动/已释放
+    FOC_OL_MOVE_RUN,        // 转动中（按开环命令速率定步长积分判到位）
+    FOC_OL_MOVE_HOLD,       // 已到位悬停保持（冻结电角度 + d 轴通电形成电弹簧）
+    FOC_OL_MOVE_PULL        // 回拉中（偏差超出死区，低速反向回拉至滞环内）
+} FOC_OpenLoopMoveState_t;
 
 // 力矩模式最大 Iq 限幅（A）：取电机额定 14A
 //   原 45A 会算出 i_mag = √1.5×45 = 55A，既超 STALL_CURRENT_LIMIT(45A)，又正好顶到
@@ -93,6 +120,12 @@ typedef struct {
                                      //     所有 FOC_SetMode 调用都会清零本标志（含 CAN/串口/启动序列）
 	  FOC_State_t mode;		// 当前工作状态
     FOC_ClosedLoopMode_t closedloop_mode;   // 闭环级联深度（力矩/速度/位置）
+    // 开环"转到指定输出端角度 + 悬停保持"子状态机（由 FOC_Update 20kHz 中断非阻塞推进）
+    uint8_t openloop_move_state;      // FOC_OpenLoopMoveState_t：0=IDLE 1=RUN 2=HOLD 3=PULL，直接作为状态帧 byte0
+    uint8_t openloop_move_stop_req;   // 1 = 请求中止"运动/悬停"动作（主循环置位，20kHz 中断原子消费并释放）
+    float   openloop_move_remain;     // RUN 阶段剩余电角度 (rad，非负)，递减到 0 判到位；其余状态为 0
+    float   openloop_move_ref_mech;   // 本次动作起点：电机轴多圈机械角 (rad)，供 CAN 层换算输出端相对角
+    float   openloop_move_hold_mech;  // 到位悬停点：电机轴多圈机械角 (rad)，供 CAN 层换算悬停偏差
     // 位置环字段（减速器输出端位置，单位 rad，Encoder2_Angle_Multiturn 范围）
     float target_position;       // 目标输出端位置 (rad)
     float position_error;        // 实时位置误差 = target_position - current_position（仅诊断/保护读）
@@ -151,6 +184,8 @@ void FOC_SVPWM(void);
 void FOC_SetMode(FOC_State_t mode);
 void FOC_SetClosedLoopMode(FOC_ClosedLoopMode_t mode);  // 设置闭环级联深度（力矩/速度/位置）
 void FOC_SetOpenLoopVoltage(float voltage);
+void FOC_StartOpenLoopMoveHold(float out_rad);    // 开环转到输出端角度 out_rad(rad，0 忽略)并悬停保持
+void FOC_StopOpenLoopMoveHold(void);              // 中止"转角度/悬停"动作并释放（电压、速度归零）
 void FOC_SetTargetPosition(float position_rad);   // 设置目标位置（位置级联），内部已含软限位钳制
 void FOC_SetSoftLimits(float min_rad, float max_rad); // 设置软限位阈值（需 min < max）
 void FOC_SetPositionErrorLimit(float error_rad);  // 设置位置跟随误差阈值

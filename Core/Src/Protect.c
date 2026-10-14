@@ -13,10 +13,8 @@ extern volatile uint8_t fault_code;   // 故障诊断码锁存
 extern volatile float KTH7823_Speed_Rads;   // 机械角速度 (rad/s)，超速/堵转检测用
 extern float control_dt;   // 控制周期 (s)，I²t 累积用
 
-//编码器掉线
-static uint32_t encoder_last_count = 0; // 编码器更新基准，上一次的值
-static uint32_t encoder_stall_ticks = 0; // 连续未变化的中断周期数
-volatile uint16_t encoder_stall_max = 0; // 记录主循环到底最长卡过多久
+//编码器读数有效性（断线/无磁）监测
+volatile uint16_t encoder_stall_max = 0; // 记录观察到的最大连续异常读数次数（诊断用）
 static uint8_t  enc_armed = 0; // 监测是否准备标志位
 static uint32_t enc_arm_tick = 0; // 记录监测起始点
 
@@ -34,6 +32,21 @@ float soft_limit_min  = -3.14159f;  // 默认 -π（约 -180°）
 float soft_limit_max  =  3.14159f;  // 默认 +π
 float pos_error_limit =  0.05f;     // 默认位置跟随误差 0.05 rad（约 2.9°，按需调整）
 
+// 关闭三路 PWM 输出，但保持 TIM1 计数器继续运行（所有保护分支统一走这里）
+// 为何必须补回 CEN：HAL_TIM_PWM_Stop 在最后一个通道关闭时会调用 __HAL_TIM_DISABLE，
+// 其守卫条件(CCER 的 CC1E~CC6E / CC1NE~CC4NE 全为 0)此时成立，于是 TIM1 的 CEN 被清零、
+// 计数器停摆 -> 20kHz 更新中断彻底消失 -> FOC_STATE_FAULT 退避恢复(含 DRV8353_Recover)、
+// 故障 LED 指示、control_tick 以及全部 50µs 级保护巡检一并冻结，且 foc.mode 会停留在
+// 故障前的值形成"假状态"。输出安全（CCxE=0 + MOE=0 + DRV8353 EN 拉低进睡眠）与是否
+// 继续计数无关，因此这里关断输出后显式补回 CEN，保住控制回路与保护的可观测性。
+void Protect_StopPWM(void)
+{
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+    __HAL_TIM_ENABLE(&htim1);   // 补回 CEN，抵消 HAL_TIM_PWM_Stop 的副作用
+}
+
 // 检测三相合成电流幅值，超阈值即停驱动并交状态机处理
 // 无本地锁存：每拍独立判定，重试后仍过流会自然再次触发，避免竞态
 void Protect_StallCheck(void)
@@ -49,52 +62,42 @@ void Protect_StallCheck(void)
         fault_code = FAULT_CODE_STALL;   // 锁存软件故障码（先于 Disable，供主循环上报）
         // 触发硬件保护：关闭栅极驱动 + 停三路 PWM
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;   // 交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机走指数退避自动恢复
     }
 }
 
-// 编码器失速/断线监测
-// 原理：KTH7823_UpdateAngle 在主循环以 ~1kHz 刷新 encoder_update_count。
-// 本函数在控制中断（20kHz，50µs/拍）内调用，若连续 ENCODER_STALL_TIMEOUT_TICKS个
-// 中断周期计数都未增长，说明主循环未刷新编码器（SPI 卡死/断线/主循环阻塞），
-// 则触发硬件保护，交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机走退避恢复。
+// 编码器读数有效性/断线监测
+// 原理：KTH7823 的 SPI 读取已移入 TIM3 中断（10kHz）刷新，读到 0x0000/0xFFFF 视为
+//       断线/无磁等无效读数，由 KTH7823_UpdateAngle 累计到 kth7823_raw_fault_cnt
+//       （正常读数立即清零）。本函数在控制中断（20kHz，50µs/拍）内调用，连续异常
+//       读数达到 KTH7823_RAW_FAULT_LIMIT 即判定编码器失效，触发硬件保护。
+// 注：主循环存活由 IWDG 单独保障（阻塞循环也已不再负责编码器刷新），此处不再判定。
 void Protect_EncoderStallCheck(void)
 {
-    // ---- 准备阶段：等主循环至少刷新过一次，再观察 ARM_DELAY 后才开始监测 ----
+    // ---- 准备阶段：等 TIM3 中断开始刷新编码器，再观察 ARM_DELAY 后才开始监测 ----
     if (!enc_armed) {
-        encoder_last_count  = encoder_update_count;
-        encoder_stall_ticks = 0;
-        if (encoder_update_count != 0) {                 // 主循环已跑起来
+        if (encoder_update_count != 0) {                 // 编码器已在中断内刷新
             if (enc_arm_tick == 0) enc_arm_tick = HAL_GetTick();
             else if (HAL_GetTick() - enc_arm_tick > ENCODER_ARM_DELAY_MS) {
                 enc_armed = 1;
-                encoder_last_count = encoder_update_count;
             }
         } else {
-            enc_arm_tick = 0;                            // 还没跑起来，计时作废
+            enc_arm_tick = 0;                            // 还没刷新，计时作废
         }
         return;
     }
 
-    if (encoder_update_count != encoder_last_count) {        // 编码器正常刷新：更新基准并清零失速计数
-        encoder_last_count = encoder_update_count;
-        encoder_stall_ticks = 0;
-    } else {        // 计数未增长：累计失速节拍
-        encoder_stall_ticks++;
-        if (encoder_stall_ticks > encoder_stall_max) encoder_stall_max = encoder_stall_ticks;
-        if (encoder_stall_ticks >= ENCODER_STALL_TIMEOUT_TICKS) {         // 持续未刷新（默认 10ms @20kHz），判定编码器失效
-            fault_code = FAULT_CODE_ENCODER_STALL;  // 锁存软件故障码
-            DRV8353_Disable();
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
-            fault_triggered = 1;
-            enc_armed = 0;      // 触发后重新准备
-            enc_arm_tick = 0;
-        }
+    // 记录观察到的最大连续异常读数次数（诊断用）
+    if (kth7823_raw_fault_cnt > encoder_stall_max) encoder_stall_max = kth7823_raw_fault_cnt;
+
+    if (kth7823_raw_fault_cnt >= KTH7823_RAW_FAULT_LIMIT) {   // 连续无效读数达阈值：判定编码器断线/无磁
+        fault_code = FAULT_CODE_ENCODER_STALL;  // 锁存软件故障码
+        DRV8353_Disable();
+        Protect_StopPWM();
+        fault_triggered = 1;
+        enc_armed = 0;      // 触发后重新准备
+        enc_arm_tick = 0;
     }
 }
 
@@ -121,9 +124,7 @@ void Protect_CommTimeoutCheck(void)
         if (comm_silent_ticks >= COMM_TIMEOUT_TICKS) {
             fault_code = FAULT_CODE_COMM_TIMEOUT;   // 锁存通讯失联故障码
             DRV8353_Disable();
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+            Protect_StopPWM();
             fault_triggered = 1;   // 交由 FOC_STATE_FAULT 状态机退避恢复；重新收到帧后自动解除
         }
     }
@@ -138,6 +139,13 @@ void Protect_CommDisarm(void)
     comm_last_count = comm_rx_count;
 }
 
+// 失联保护是否已武装（1 = 已收到过 CAN 帧、失联检测生效中）。
+// 仅供串口 can 诊断命令显示，不改变任何状态。
+uint8_t Protect_CommIsArmed(void)
+{
+    return comm_armed;
+}
+
 // MOSSFET/线圈过温保护
 // 温度超过关断阈值即停驱动并交状态机退避；
 // 恢复条件在 FOC_Update 的 FOC_STATE_FAULT 分支内：温度未降到恢复阈值则继续冷却（滞回）
@@ -146,9 +154,7 @@ void Protect_OvertempCheck(void)
     if (ntc_temperature > OVERTEMP_SHUTDOWN || mos_temperature > OVERTEMP_SHUTDOWN) {
         fault_code = FAULT_CODE_OVERTEMP;   // 锁存过温故障码（先于 Disable，供主循环上报）
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;   // 交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机退避恢复
     }
 }
@@ -168,17 +174,13 @@ void Protect_BusVoltageCheck(void)
         ov_cnt = 0;
         fault_code = FAULT_CODE_OVERVOLT;   // 锁存过压故障码
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;
     } else if (uv_cnt >= BUS_TRIP_CONFIRM_TICKS){
         uv_cnt = 0;
         fault_code = FAULT_CODE_UNDERVOLT;  // 锁存欠压故障码
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;
     }
 }
@@ -198,9 +200,7 @@ void Protect_PositionErrorCheck(void)
         if (foc.pos_err_integral_acc >= POS_ERR_TIMEOUT_TICKS) {
             fault_code = FAULT_CODE_POS_ERROR;   // 锁存位置跟随误差故障码
             DRV8353_Disable();
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+            Protect_StopPWM();
             fault_triggered = 1;
         }
     } else {
@@ -225,9 +225,7 @@ void Protect_SoftLimitCheck(void)
         if (foc.pos_err_integral_acc >= SOFT_LIMIT_TIMEOUT_TICKS) {
             fault_code = FAULT_CODE_SOFT_LIMIT;   // 锁存软限位故障码
             DRV8353_Disable();
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+            Protect_StopPWM();
             fault_triggered = 1;
         }
     } else {
@@ -243,9 +241,7 @@ void Protect_OverspeedCheck(void)
     if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_THRESHOLD) {
         fault_code = FAULT_CODE_OVERSPEED;   // 锁存超速故障码
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;
     }
 }
@@ -262,9 +258,7 @@ void Protect_PhasePeakCheck(void)
     if (i_peak > PHASE_PEAK_CURRENT_LIMIT) {
         fault_code = FAULT_CODE_PHASE_OC;   // 锁存单相峰值过流故障码
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;
     }
 }
@@ -286,9 +280,7 @@ void Protect_I2tCheck(void)
     if (i2t_accum > I2T_TRIP_THRESHOLD) {
         fault_code = FAULT_CODE_I2T;   // 锁存 I²t 过流故障码
         DRV8353_Disable();
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+        Protect_StopPWM();
         fault_triggered = 1;
     }
 }
@@ -298,7 +290,7 @@ void Protect_FOC(void)
 {
 	// 软堵转/过流保护：三相合成电流超阈值则关驱动、停 PWM，并置 fault 标志
 	Protect_StallCheck();
-	// 编码器失速/断线监测：主循环未刷新编码器则触发保护
+	// 编码器读数有效性/断线监测：连续无效读数(0x0000/0xFFFF)则触发保护
 	Protect_EncoderStallCheck();
 	// 上位机通讯失联监测：CAN 心跳超时则触发保护
 	Protect_CommTimeoutCheck();

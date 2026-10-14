@@ -1,4 +1,5 @@
 #include "kth7823.h"
+#include "main.h"        // ME_CS_Pin / ME_CS_GPIO_Port
 #include "arm_math.h"
 #include "spi.h"
 #include "dwt_delay.h"   // DWT_DelayMs
@@ -11,8 +12,11 @@ float KTH7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧�
 float KTH7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
 volatile float KTH7823_Speed_Rads = 0.0f;	// 当前速度（rad/s）
 
-// 刷新心跳计数器：每次 KTH7823_UpdateAngle 调用 +1，供失速/断线监测判断主循环是否在跑
+// 刷新心跳计数器：每次 KTH7823_UpdateAngle 调用 +1，供失速/断线监测判断编码器是否在刷新
 volatile uint32_t encoder_update_count = 0;
+
+// 连续异常读数（0x0000/0xFFFF）计数：正常读数清零，供 Protect_EncoderStallCheck 判定读数有效性
+volatile uint16_t kth7823_raw_fault_cnt = 0;
 
 // 滤波变量
 static float filtered_cos = 1.0f;
@@ -30,9 +34,9 @@ static uint16_t spi_exchange_frame(uint16_t tx)
     uint16_t txw = tx;   // 直接 16 位，硬件 MSB 先发，无字节序问题
     uint16_t rxw = 0;
 
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_RESET);
     HAL_SPI_TransmitReceive(KTH7823_SPI, (uint8_t *)&txw, (uint8_t *)&rxw, 1, 100);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_SET);
 
     return rxw;   // HAL 16 位模式已写入完整 16 位
 }
@@ -67,6 +71,8 @@ void KTH7823_Init(void)
     angle_unwrapped = 0.0f;
     last_unwrapped_angle = 0.0f;  // 复位速度差分基准，避免重新 Init 后首帧速度跳变
     last_speed_tick = 0;          // 复位速度计时基准，首帧 UpdateSpeed 不计算速度
+    kth7823_raw_fault_cnt = 0;    // 复位异常读数计数
+    encoder_update_count = 0;
 
     //  丢弃首次无效值 + 建立通信 
     KTH7823_ReadAngleRaw();
@@ -78,6 +84,13 @@ void KTH7823_UpdateAngle(void)
 {
     uint16_t raw = KTH7823_ReadAngleRaw();
 	float raw_rad = raw_to_rad(raw);
+
+    // 异常读数统计：0x0000/0xFFFF 视为断线/无磁等无效读数，连续累加；正常读数清零
+    if (raw == 0x0000u || raw == 0xFFFFu) {
+        if (kth7823_raw_fault_cnt < 0xFFFFu) kth7823_raw_fault_cnt++;
+    } else {
+        kth7823_raw_fault_cnt = 0;
+    }
 	
     // 多圈解包裹：用 16 位带符号差值累积
     if (!raw_initialized) {
@@ -116,7 +129,7 @@ void KTH7823_UpdateAngle(void)
     // 输出：多圈总角度
     KTH7823_Angle_Multiturn = angle_unwrapped;
 
-    // 心跳计数，供 Protect_EncoderStallCheck 监测主循环是否存活
+    // 采样心跳计数（中断内递增），供 Protect 判断编码器是否在刷新
     encoder_update_count++;
 }
 
@@ -152,4 +165,15 @@ void KTH7823_UpdateSpeed(void)
 
     last_unwrapped_angle = angle_unwrapped;
     last_speed_tick = now;
+}
+
+/**
+ * @brief 编码器刷新入口，供 TIM3 更新中断调用（10kHz/20kHz，与电流采样同相位）
+ * @note  中断内为唯一写者（TIM1 控制中断可抢占 TIM3），故角度/速度全局量不会撕裂；
+ *        仅依赖 SysTick/DWT，不做任何阻塞等待（SPI 超时在正常 9MHz 下不会触发）。
+ */
+void KTH7823_UpdateISR(void)
+{
+    KTH7823_UpdateAngle();   // 读角度 -> 解包裹 -> 滤波 -> 更新多圈角度，并累加采样心跳
+    KTH7823_UpdateSpeed();   // 用 DWT 差分更新速度
 }

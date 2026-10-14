@@ -34,12 +34,11 @@
 #define POS_ERR_TIMEOUT_TICKS   1000   // 位置跟随误差持续超限的控制周期数（20kHz 下 = 50ms）
 #define SOFT_LIMIT_TIMEOUT_TICKS 400   // 目标位置在软限位外持续未收敛的控制周期数（20kHz 下 = 20ms）
 
-// 编码器失速/断线监测阈值
-// 主循环以 ~1kHz 刷新 encoder_update_count；中断 20kHz 调用本检测。
-// 连续 ENCODER_STALL_TIMEOUT_TICKS 个中断周期（200 × 50µs = 10ms）计数无增长
-// 即判定编码器失效（SPI 卡死/断线/主循环阻塞）。
-#define ENCODER_STALL_TIMEOUT_TICKS   200
-#define ENCODER_ARM_DELAY_MS  100    // 主循环稳定跑起来后再观察 100ms 
+// 编码器读数有效性/断线监测阈值
+// 编码器刷新已在 TIM3 中断（10kHz）内完成，主循环存活由 IWDG 单独保障；
+// 判据改为"读数有效性"：连续读到异常原始值（0x0000/0xFFFF）达 KTH7823_RAW_FAULT_LIMIT
+// 次即判定编码器断线/无磁失效（该阈值定义在 kth7823.h，本检测在 20kHz 控制中断内调用）。
+#define ENCODER_ARM_DELAY_MS  100    // 编码器开始刷新后再观察 100ms，避免上电误触发
 
 // 上位机通讯失联保护（CAN 心跳看门狗）
 // 上位机以 1kHz（每 1ms 一帧）周期性发送 CAN 帧，每收到一帧调用 Protect_CommFeed() 刷新心跳。
@@ -74,10 +73,13 @@
 #define OVERSPEED_THRESHOLD   230.0f   // 超速停机阈值 (rad/s)，≈1.2×电机轴额定
 #define OVERSPEED_RECOVER     200.0f   // 恢复阈值 (rad/s)，≈1.05×额定，滞回 30
 
+// 关闭三路 PWM 输出但保持 TIM1 计数（供所有保护分支/故障回调统一调用）
+void Protect_StopPWM(void);
+
 // 检测堵转电流
 void Protect_StallCheck(void);
 
-// 监测编码器刷新心跳，失效则触发硬件保护
+// 监测编码器读数有效性（连续无效读数），失效则触发硬件保护
 void Protect_EncoderStallCheck(void);
 
 // CAN 每收到一帧数据时调用（在 HAL_FDCAN_RxFifo0Callback 中断内），刷新通讯心跳
@@ -85,6 +87,12 @@ void Protect_CommFeed(void);
 
 // 关闭失联保护（进入本地调试态），串口 enable 命令调用；CAN 再次发帧后自动恢复
 void Protect_CommDisarm(void);
+
+// 通讯心跳计数：每收到一帧本节点 CAN 命令帧 +1（接收中断内自增），串口 can 诊断命令读取
+extern volatile uint32_t comm_rx_count;
+
+// 当前失联保护是否已武装（1 = 收到过 CAN 帧、失联检测已生效），串口 can 诊断命令显示
+uint8_t Protect_CommIsArmed(void);
 
 // 上位机通讯连续中断超时
 void Protect_CommTimeoutCheck(void);

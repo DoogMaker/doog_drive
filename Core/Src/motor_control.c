@@ -60,6 +60,14 @@ void MotorControl_Init(void)
 		
 		//启动 TIM1 基本计数
 		HAL_TIM_Base_Start_IT(&htim1); 
+
+    // 启动 TIM3 更新中断（编码器刷新，10kHz，与电流采样同相位）
+    // 注意：TIM3 配置为 Trigger Mode + ITR0(=TIM1_TRGO=更新事件)，
+    //       HAL 在此模式下不置 CEN，TIM3 由 TIM1 的第一个更新沿启动。
+    //       Trigger Mode 只控制"启动"、不复位计数器（见 AN4013），故 TIM3 启动后
+    //       即用内部 72MHz 自由运行，TIM1 后续是否仍计数都不影响编码器刷新。
+    //       本调用只使能更新中断(DIER.UIE)，不手动启动计数。
+    HAL_TIM_Base_Start_IT(&htim3);
 		
     //ADC自校准
     HAL_ADCEx_Calibration_Start(&hadc1,ADC_DIFFERENTIAL_ENDED);
@@ -84,7 +92,7 @@ void MotorControl_Init(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM1) {
-    // 角度/速度 SPI 读取已在主循环完成，中断只消费缓存，避免阻塞 20kHz 控制节拍
+    // 角度/速度 SPI 读取已移入 TIM3 中断，本中断只消费缓存，避免阻塞 20kHz 控制节拍
     // 注：foc.angle / foc.speed 由 FOC_Update 内部各模式分支统一赋值，此处不再冗余写入
 
     // 更新采样
@@ -97,6 +105,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     // 控制节拍计数
     control_tick++;
+  }
+  else if (htim->Instance == TIM3) {
+    // 编码器刷新（10kHz，与 TIM1 更新事件同相位）：读角度 + 更新速度
+    // TIM3 抢占优先级(2)低于 TIM1(1)，可被 20kHz 控制中断抢占
+    KTH7823_UpdateISR();
   }
 }
 

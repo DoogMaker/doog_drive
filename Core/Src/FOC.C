@@ -45,6 +45,13 @@ extern volatile float KTH7823_Speed_Rads;
 extern volatile uint8_t fault_triggered;	
 extern volatile uint32_t control_tick;   // 控制节拍计数（motor_control.c 定义）
 
+// 开环"转到指定输出端角度 + 到位悬停保持"状态机私有量（仅 20kHz 控制中断读写）
+static float    ol_hold_voltage = 0.0f;   // 本次动作的悬停/回拉电压 (V)，启动时已按上限限幅
+static float    ol_theta_hold   = 0.0f;   // 到位悬停点对应的电角度 (rad)，回拉后用它复位以防逐次漂移
+static uint32_t ol_move_t0      = 0;      // 运动阶段起始时刻 (ms)，用于超时判定
+static uint32_t ol_pull_t0      = 0;      // 本次回拉起始时刻 (ms)
+static float    ol_pull_speed   = 0.0f;   // 本次回拉的低速给定 (rad/s，带符号)，回拉期间每拍重申
+
 /* ---------------- 对齐：末尾窗口平均定位（替代单点采样） ----------------
  * 单点采样对"转子残余振荡"和"编码器噪声"都极其敏感：励磁电压越高转子冲得越猛，
  * 800ms 采样那一刻越可能撞上振荡相位，表现为 |delta| 忽大忽小（0.8V 实测就是如此）。
@@ -119,15 +126,6 @@ PID_Params_t id_params = {
 	.int_min = -0.03f, .int_max = 0.03f
 };
 
-// 位置环 PID 参数（最外环：位置 → 速度）
-// 单位：target/feedback = 输出端位置 (rad)；输出 = 目标速度 (rad/s，电机轴)
-// 输出限幅 = 最大目标速度（与超速阈值一致），Kp/Ki/D 需按机械惯量调参
-PID_Params_t position_params = {
-	.Kp = 5.0f,    .Ki = 0.5f,    .Kd = 0.0f,
-	.out_min = -230.0f, .out_max = 230.0f,
-	.int_min = -230.0f, .int_max = 230.0f
-};
-
 // q轴电流环 PID 参数
 // 单位：target/feedback = A；输出 = Vq(V)
 // 与 d 轴同源（表贴式 PMSM 的 Ld≈Lq），设计依据与 id_params 完全一致
@@ -135,6 +133,15 @@ PID_Params_t iq_params = {
 	.Kp = 0.15f,    .Ki = 450.0f,    .Kd = 0.0f,
 	.out_min = -12.0f, .out_max = 12.0f,
 	.int_min = -0.03f, .int_max = 0.03f
+};
+
+// 位置环 PID 参数（最外环：位置 → 速度）
+// 单位：target/feedback = 输出端位置 (rad)；输出 = 目标速度 (rad/s，电机轴)
+// 输出限幅 = 最大目标速度（与超速阈值一致），Kp/Ki/D 需按机械惯量调参
+PID_Params_t position_params = {
+	.Kp = 5.0f,    .Ki = 0.5f,    .Kd = 0.0f,
+	.out_min = -230.0f, .out_max = 230.0f,
+	.int_min = -230.0f, .int_max = 230.0f
 };
 
 //FOC算法初始化
@@ -162,6 +169,16 @@ void FOC_Init(void)
 	foc.target_Iq = 0.0f;
 	foc.openloop_angle = 0.0f;
 	foc.openloop_hold = 0;          // 开环保持（电弹簧）默认关闭
+	foc.openloop_move_state     = FOC_OL_MOVE_IDLE;   // 开环"转角度+悬停"子状态机默认空闲
+	foc.openloop_move_stop_req  = 0;
+	foc.openloop_move_remain    = 0.0f;
+	foc.openloop_move_ref_mech  = 0.0f;
+	foc.openloop_move_hold_mech = 0.0f;
+	ol_hold_voltage = 0.0f;
+	ol_theta_hold   = 0.0f;
+	ol_move_t0      = 0;
+	ol_pull_t0      = 0;
+	ol_pull_speed   = 0.0f;
 	foc.Vd = 0.0f;
 	foc.Vq = 0.0f;
 	
@@ -266,6 +283,198 @@ void FOC_SVPWM(void)
 	foc.Tc = Tc;
 }
 
+/* ==================== 开环"转到指定输出端角度 + 到位悬停保持"（电弹簧）====================
+ * 设计要点（完整说明见 docs/CAN上位机控制指令说明.md）：
+ *   - RUN  ：开环无位置反馈，靠对"命令电角度速率 target_speed_ramp"按控制节拍定步长积分判到位
+ *            （与同一中断内推进 openloop_angle 同源）；输出端机械角 -> 电机轴(×减速比) -> 电角度(×极对数)。
+ *   - HOLD ：到位后冻结电角度、改用 d 轴持续通电（与 ALIGN 磁力定位同形态）形成"电弹簧"，
+ *            转子被磁力钳在到位点附近，偏离即自动产生回复力矩；每拍重申给定（幂等自愈）。
+ *   - PULL ：以电机轴编码器(KTH7823_Angle_Multiturn，未滤波)监测偏差，超出 ±FOC_OL_HOLD_BAND_DEG
+ *            时解除冻结、按 FOC_OL_HOLD_PULL_SPEED 低速回拉，回到 ±FOC_OL_HOLD_HYST_DEG 内重新冻结。
+ *   - 悬停**不计时释放**，一直保持；仅当①收到 v=0（0x02 电压为 0）或②离开开环模式时释放
+ *     （释放后电压、速度归零）。因此悬停期间 d 轴持续通电发热，请按需及时释放。
+ * 全部在 20kHz 控制中断内非阻塞推进：每拍 O(1)，无循环/等待/动态内存，ISR 安全。
+ */
+
+// 电角度归一化到 [0, 2π)（与 FOC_Update 开环分支一致）
+static float FOC_OL_NormElecAngle(float a)
+{
+	a = fmodf(a, FOC_OL_TWO_PI);
+	if (a < 0.0f) a += FOC_OL_TWO_PI;
+	return a;
+}
+
+// 当前转子电角度（与 FOC_SetMode 进入开环时的表达式/角度源完全一致）
+static float FOC_OL_RotorElecAngle(void)
+{
+	return FOC_OL_NormElecAngle((KTH7823_Angle_Multiturn - encoder_offset) *
+	                            (float)encoder_direction * (float)MOTOR_POLE_PAIRS);
+}
+
+// 释放：清状态与保持标志，电压/速度归零（不动 manual_speed/manual_voltage，保持既有使用顺序）
+static void FOC_OL_Release(void)
+{
+	foc.openloop_move_state  = FOC_OL_MOVE_IDLE;
+	foc.openloop_move_remain = 0.0f;
+	foc.openloop_hold        = 0;
+	foc.target_speed         = 0.0f;
+	foc.target_speed_ramp    = 0.0f;
+	foc.openloop_voltage     = 0.0f;
+	ol_pull_speed            = 0.0f;
+}
+
+// 20kHz 控制中断内推进的状态机（非阻塞）
+static void FOC_OpenLoopMoveHold_Service(void)
+{
+	// 离开开环模式（切模式/保护停机）或收到外部中止请求（如 v=0 释放）时中止悬停并释放输出。
+	// 外部请求由主循环置位、这里在中断内统一消费完成，避免主循环与中断并发写同一状态相互覆盖。
+	// （保护停机是直接改 foc.mode，未经 FOC_SetMode，故这里必须自查模式。）
+	uint8_t stop_req = foc.openloop_move_stop_req;
+	if (stop_req) foc.openloop_move_stop_req = 0;
+
+	if (stop_req || foc.mode != FOC_STATE_OPENLOOP) {
+		if (foc.openloop_move_state != FOC_OL_MOVE_IDLE) {
+			// 回拉阶段曾临时改写目标速度，退出时一并清零，避免残留速度在后续进入开环时意外转动
+			if (foc.openloop_move_state == FOC_OL_MOVE_PULL) {
+				foc.target_speed      = 0.0f;
+				foc.target_speed_ramp = 0.0f;
+			}
+			if (stop_req && foc.mode == FOC_STATE_OPENLOOP) {
+				FOC_OL_Release();     // v=0 显式释放：动作 + 电压/速度全归零
+			} else {
+				foc.openloop_move_state  = FOC_OL_MOVE_IDLE;   // 仅清动作，避免影响其它模式的给定
+				foc.openloop_move_remain = 0.0f;
+				foc.openloop_hold        = 0;
+			}
+		}
+		return;
+	}
+
+	const float band = FOC_OL_HOLD_BAND_DEG * FOC_OL_DEG2RAD;   // 死区 (±rad，电机轴)
+	const float hyst = FOC_OL_HOLD_HYST_DEG * FOC_OL_DEG2RAD;   // 回拉滞环 (±rad，电机轴)
+	float dev;
+
+	switch ((FOC_OpenLoopMoveState_t)foc.openloop_move_state) {
+		case FOC_OL_MOVE_RUN:
+			// 定步长积分判到位：remain 从目标电角度递减到 0
+			foc.openloop_move_remain -= fabsf(foc.target_speed_ramp) * (float)MOTOR_POLE_PAIRS * control_dt;
+			if (foc.openloop_move_remain <= 0.0f) {
+				// 到位：清速度给定 + 冻结电角度 + d 轴通电，进入电弹簧悬停
+				foc.target_speed            = 0.0f;
+				foc.target_speed_ramp       = 0.0f;
+				foc.openloop_voltage        = ol_hold_voltage;
+				ol_theta_hold               = FOC_OL_RotorElecAngle();
+				foc.openloop_angle          = ol_theta_hold;
+				foc.openloop_move_hold_mech = KTH7823_Angle_Multiturn;   // 记录悬停点(电机轴机械角)
+				foc.openloop_hold           = 1;
+				foc.openloop_move_remain    = 0.0f;
+				foc.openloop_move_state     = FOC_OL_MOVE_HOLD;   // 无限期保持，由 v=0 / 切模式释放
+			} else if ((HAL_GetTick() - ol_move_t0) >= FOC_OL_MOVE_TIMEOUT_MS) {
+				// 运动超时（未转够）：不进入悬停，直接断电释放
+				FOC_OL_Release();
+			}
+			break;
+
+		case FOC_OL_MOVE_HOLD:
+			// 幂等重申：冻结电角度 + d 轴通电 + 速度给定归零（自愈，保证不被常规刷新打断）
+			foc.openloop_angle   = ol_theta_hold;
+			foc.openloop_hold    = 1;
+			foc.openloop_voltage = ol_hold_voltage;
+			foc.target_speed      = 0.0f;
+			foc.target_speed_ramp = 0.0f;
+			// 偏差：正 = 转子朝"正转(+开环方向)"偏出到位点
+			dev = (KTH7823_Angle_Multiturn - foc.openloop_move_hold_mech) * (float)encoder_direction;
+
+			if (fabsf(dev) > band) {
+				// 逃出死区：解除冻结，平衡点对齐当前位置（避免跨极反向弹走），低速反向回拉
+				foc.openloop_hold    = 0;
+				foc.openloop_angle   = FOC_OL_RotorElecAngle();
+				ol_pull_speed        = (dev > 0.0f) ? -FOC_OL_HOLD_PULL_SPEED : FOC_OL_HOLD_PULL_SPEED;
+				foc.target_speed     = ol_pull_speed;
+				foc.openloop_voltage = ol_hold_voltage;
+				ol_pull_t0           = HAL_GetTick();
+				foc.openloop_move_state = FOC_OL_MOVE_PULL;
+			}
+			// 注意：悬停不按时间自动释放，会一直保持到 v=0（0x02 电压为 0）或离开开环模式
+			break;
+
+		case FOC_OL_MOVE_PULL:
+			// 回拉中：幂等重申低速给定与回拉电压（防被 0x01 等常规刷新打断）
+			foc.openloop_hold    = 0;
+			foc.openloop_voltage = ol_hold_voltage;
+			foc.target_speed     = ol_pull_speed;
+			dev = (KTH7823_Angle_Multiturn - foc.openloop_move_hold_mech) * (float)encoder_direction;
+
+			if (fabsf(dev) <= hyst ||
+			           ((dev > 0.0f) != (ol_pull_speed < 0.0f)) ||
+			           ((HAL_GetTick() - ol_pull_t0) >= FOC_OL_HOLD_PULL_TIMEOUT_MS)) {
+				// 回到滞环内 / 已越过到位点(偏差变号) / 单次回拉超时：重新冻结保持
+				foc.target_speed      = 0.0f;
+				foc.target_speed_ramp = 0.0f;
+				foc.openloop_voltage  = ol_hold_voltage;
+				// 悬停点优先回归原始位置（防逐次回拉累积漂移）；偏差超出弹簧吸引域
+				// (±180 电角度 ≈ ±8.6° 电机轴机械角)时退化为对齐当前位置，否则回复力矩会反向推开转子
+				if (fabsf(dev) * (float)MOTOR_POLE_PAIRS < FOC_OL_TWO_PI * 0.5f) {
+					foc.openloop_angle = ol_theta_hold;
+				} else {
+					foc.openloop_angle = FOC_OL_RotorElecAngle();
+				}
+				foc.openloop_hold       = 1;
+				foc.openloop_move_state = FOC_OL_MOVE_HOLD;   // 重新进入无限期悬停保持
+			}
+			break;
+
+		case FOC_OL_MOVE_IDLE:
+		default:
+			break;
+	}
+}
+
+// 启动一次"开环转动 + 到位悬停保持"。out_rad 为减速器输出端目标角度(rad)，0 忽略。
+// 说明：内部会调用 FOC_SetMode(FOC_STATE_OPENLOOP) 保证状态一致；
+//       速度/电压优先复用当前给定(foc.target_speed/foc.openloop_voltage)，未设定则用缺省值。
+void FOC_StartOpenLoopMoveHold(float out_rad)
+{
+	if (fabsf(out_rad) < 1e-5f) return;   // 0° 视为无效，直接忽略（不驱动、不改状态）
+
+	float spd = fabsf(foc.target_speed);
+	if (spd < 0.1f) spd = FOC_OL_DEFAULT_SPEED;      // 速度未设定则用缺省
+	float vol = foc.openloop_voltage;
+	if (vol < 0.05f) vol = FOC_OL_DEFAULT_VOLTAGE;   // 电压未设定则用缺省
+	float hold_vol = (vol > FOC_OL_HOLD_VOLTAGE_MAX) ? FOC_OL_HOLD_VOLTAGE_MAX : vol;
+
+	float dir = (out_rad >= 0.0f) ? 1.0f : -1.0f;
+
+	// 输出端机械角 -> 电机轴机械角 -> 电角度 (rad)
+	float target_elec = fabsf(out_rad) * GEAR_RATIO_OUT2MOTOR * (float)MOTOR_POLE_PAIRS;
+
+	// ---- 启动交接顺序：先置 IDLE，再写全部参数，最后置 RUN（主循环写 / 中断读，避免半成品被执行）----
+	foc.openloop_move_state = FOC_OL_MOVE_IDLE;
+
+	// 进入开环并给定速度/电压（FOC_SetMode 会清零 openloop_hold 与状态机，故参数在其后写）
+	FOC_SetMode(FOC_STATE_OPENLOOP);
+	foc.target_speed      = dir * spd;
+	foc.target_speed_ramp = 0.0f;                 // 从零起步，交给统一斜坡块缓启动
+	foc.openloop_hold     = 0;                    // 运动阶段为正常开环（角度按 target_speed_ramp 积分）
+	FOC_SetOpenLoopVoltage(vol);
+
+	foc.openloop_move_remain    = target_elec;
+	foc.openloop_move_ref_mech  = KTH7823_Angle_Multiturn;   // 本次动作起点（供 CAN 层算输出端相对角）
+	foc.openloop_move_hold_mech = KTH7823_Angle_Multiturn;   // 悬停点先占位，到位时再刷新
+
+	ol_hold_voltage = hold_vol;
+	ol_move_t0      = HAL_GetTick();
+
+	foc.openloop_move_stop_req = 0;                 // 清除可能残留的中止请求（FOC_SetMode 会置位）
+	foc.openloop_move_state    = FOC_OL_MOVE_RUN;   // 最后一步：使能状态机
+}
+
+// 中止"开环转动 + 到位悬停保持"动作并释放（电压、速度归零）
+void FOC_StopOpenLoopMoveHold(void)
+{
+	foc.openloop_move_stop_req = 1;
+}
+
 // FOC 核心更新函数
 void FOC_Update(void)
 {
@@ -303,6 +512,11 @@ void FOC_Update(void)
 		foc.last_recover_tick = 0;
 	}
 
+	// ---- 开环"转到指定输出端角度 + 悬停保持"状态机（20kHz 非阻塞推进）----
+	// 放在故障拦截之后、统一命令斜坡之前：状态机先决定状态并重申保持给定，
+	// 再由统一斜坡块按（可能刚被更新的）openloop_hold/电压完成电压斜坡。
+	FOC_OpenLoopMoveHold_Service();
+
 	// ---- 统一命令斜坡（开环/闭环共用，防启动冲击）----
 	// 速度斜坡：每拍只允许 target_speed 朝命令值靠近 rate*dt
 	{
@@ -315,6 +529,9 @@ void FOC_Update(void)
 	// 开环电压斜坡：仅开环分支使用，闭环下恒等于给定值（无影响）
 	{
     	float v_cmd = foc.openloop_voltage;                    // 用户设定的上限
+		float v_lim = bus_voltage / 2.0f;
+		if (v_cmd > v_lim) v_cmd = v_lim;
+    	if (v_cmd < 0.0f)  v_cmd = 0.0f;
     	if (foc.openloop_hold) {
        		// 电弹簧保持：零速下 V/f 只给到 FOC_VOLT_BOOST(0.2V)，力矩不足，
        		// 故保持阶段直接用给定电压，保证"保持一定力矩"可调。
@@ -551,6 +768,10 @@ void FOC_SetMode(FOC_State_t mode)
 	// 任意模式切换（含串口 mode=/ang=、CAN、启动序列）都退出开环保持，
 	// 避免电弹簧状态残留在后续模式里造成意外通电；放在提前返回前，保证同一模式的重复调用也生效。
 	foc.openloop_hold = 0;
+	// 同时请求中止"开环运动/悬停"状态机：只置中断消费的请求标志，实际释放由 20kHz 控制中断原子完成，
+	// 避免主循环与中断并发写同一状态而相互覆盖（否则释放可能被中断的"重申"复活）。
+	// 注意：绝不动 manual_speed/manual_voltage —— 否则会破坏"先发速度/电压、再切 mode=1"的既有使用顺序。
+	foc.openloop_move_stop_req = 1;
 
 	if (foc.mode == mode) return;
 
@@ -752,4 +973,8 @@ void DBG_Monitor_Update(void)
 	// ---- 计数 ----
 	dbg.encoder_update_count = encoder_update_count;
 	dbg.control_tick         = control_tick;
+
+	// ---- 编码器读数有效性（连续异常读数 0x0000/0xFFFF 判定断线）----
+	dbg.kth_raw_fault_cnt = kth7823_raw_fault_cnt;
+	dbg.kth_raw_fault     = (kth7823_raw_fault_cnt >= KTH7823_RAW_FAULT_LIMIT) ? 1 : 0;
 }

@@ -37,4 +37,4 @@ drive/main.o: ..\Core\Src\main.c ..\Core\Inc\main.h \
   ..\Core\Inc\KTH7823.h ..\Core\Inc\encoder2.h ..\Core\Inc\foc.h \
   ..\Core\Inc\pid.h ..\Core\Inc\drv8353.h ..\Core\Inc\sense.h \
   ..\Core\Inc\fdcan_app.h ..\Core\Inc\uart_cmd.h ..\Core\Inc\dwt_delay.h \
-  ..\Core\Inc\dbg_monitor.h
+  ..\Core\Inc\dbg_monitor.h ..\Core\Inc\Protect.h

@@ -37,6 +37,7 @@
 #include "dwt_delay.h"
 #include "encoder2.h"
 #include "dbg_monitor.h"
+#include "Protect.h"     // Protect_StopPWM（故障时关断输出但保持 TIM1 计数）
 #include <stdio.h>   // sprintf（启动序列自检报告格式化）
 
 
@@ -89,9 +90,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 			fault_code = FAULT_CODE_HARDWARE;
 			// 立即停止 PWM 输出（硬件保护，必须快！）
 			DRV8353_Disable();
-      HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-      HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-      HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+      Protect_StopPWM();   // 关断三路输出但补回 CEN，避免 TIM1 停摆冻结控制中断与故障状态机
 			// 设置标志，通知 FOC 状态机进入退避
 			fault_triggered = 1;
 		} 
@@ -108,9 +107,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
  * 关键约束：
  *   1) 对齐依赖驱动已完成配置并使能（DRV8353_Init 已在 MotorControl_Init 内完成），
  *      故"驱动自检配置"必须排在对齐之前。
- *   2) 对齐逻辑跑在 20kHz 中断内，其角度源 KTH7823_Angle_Rad 由主循环 SPI 读取刷新；
- *      阻塞等待期间必须持续调用 KTH7823_UpdateAngle()/KTH7823_UpdateSpeed()，
- *      否则角度不刷新会导致对齐结果错误。
+ *   2) 对齐逻辑跑在 20kHz 中断内，其角度源 KTH7823_Angle_Rad 由 TIM3 中断(10kHz)
+ *      独立刷新，本阻塞循环无需再手动调用编码器更新。
  *   3) 启动序列阻塞约 1.6s（对齐两步），必须持续 HAL_IWDG_Refresh()，否则 IWDG(约1s) 复位。
  *   4) 任何异常（自检告警/对齐超时）仅打印提示，不阻断，最终仍进入 IDLE。
  */
@@ -158,9 +156,7 @@ static void Boot_Sequence_Run(void)
     {
         uint32_t t0 = HAL_GetTick();
         while (foc.mode == FOC_STATE_ALIGN) {
-            /* 对齐角度源必须持续刷新：SPI 读取在主循环，不在 20kHz 中断内做 */
-            KTH7823_UpdateAngle();
-            KTH7823_UpdateSpeed();
+            /* 对齐角度源由 TIM3 中断(10kHz)独立刷新，此处无需手动读取 SPI */
             /* 对齐完成时置 pending，由既有函数完成格式化上报（含 delta 过小/过大 WARN） */
             UART_ReportAlignResult();
             UART_Tx_Poll();
@@ -232,6 +228,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_ADC2_Init();
   MX_IWDG_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 	FDCAN_App_Init();
 	UART_Cmd_Init();
@@ -319,7 +316,7 @@ int main(void)
     UART_Cmd_Process();
 
 		// 自动实时上报状态
-		UART_SendStatus();
+//		UART_SendStatus();
 
 		// 对齐完成结果上报（对齐在 20kHz 控制中断里只置标志，这里做格式化+发送）
 		UART_ReportAlignResult();
@@ -332,19 +329,6 @@ int main(void)
 
 		// 处理 CAN 消息（多节点：只处理发给本节点 NODE_ID 的帧，过滤器已按 ID 区分）
     FDCAN_App_Process();
-		
-		
-		// 开环电压/速度更新
-		FOC_SetOpenLoopVoltage(manual_voltage);
-		foc.target_speed = manual_speed;
-
-		// 编码器 SPI 读取放到主循环（不在 20kHz 控制中断内阻塞 SPI）
-		KTH7823_UpdateAngle();
-		KTH7823_UpdateSpeed();
-//		Encoder2_UpdateAngle();   // 第二编码器（输出端，SPI3）
-//		Encoder2_UpdateSpeed();
-
-		DWT_DelayMs(1);   // 缩短延时，提高角度刷新率（~1kHz）
 
 		// 喂独立看门狗：主循环 1ms 周期喂狗，远小于 1s 超时
 		HAL_IWDG_Refresh(&hiwdg);
