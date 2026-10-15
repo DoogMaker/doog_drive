@@ -38,7 +38,6 @@
 #include "encoder2.h"
 #include "dbg_monitor.h"
 #include "Protect.h"     // Protect_StopPWM（故障时关断输出但保持 TIM1 计数）
-#include <stdio.h>   // sprintf（启动序列自检报告格式化）
 
 
 /* USER CODE END Includes */
@@ -50,12 +49,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// ==================== 上电自动执行启动序列配置 ====================
-#define AUTO_ALIGN_ON_BOOT     1      // 1 = 上电自动执行一次转子对齐；0 = 跳过（整机装配/带载场景可关闭）
-#define BOOT_ALIGN_TIMEOUT_MS  3000   // 自动对齐等待超时(ms)，超时则放弃并进入 IDLE
+// 注：上电自动执行启动序列已迁移至 motor_control.c（MotorControl_BootSequence）
 
 float manual_voltage = 0.0f;	// 手动给定电压 (V)，默认 0，上电不转（安全）
 float manual_speed = 0.0f;	  // 手动给定速度 (rad/s)，默认 0
+
 volatile uint8_t fault_triggered = 0;	// 驱动故障标志
 volatile uint8_t  fault_code = FAULT_CODE_NONE;  // 故障诊断码（锁存），主循环上报后清零
 volatile uint16_t fault_status1 = 0;             // 硬件故障 STATUS1 锁存（Disable 前读取）
@@ -77,7 +75,6 @@ volatile uint16_t fault_status2 = 0;             // 硬件故障 STATUS2 锁存
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void Boot_Sequence_Run(void);   // 上电自动执行启动序列（实现见 USER CODE BEGIN 0）
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 
 // 驱动故障回调函数
@@ -101,90 +98,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* ==================== 上电自动执行启动序列 ====================
- * 顺序：驱动自检配置 → 参数校验打印 → 自动对齐(可选) → 进入 IDLE 等待串口/CAN 指令
- *
- * 关键约束：
- *   1) 对齐依赖驱动已完成配置并使能（DRV8353_Init 已在 MotorControl_Init 内完成），
- *      故"驱动自检配置"必须排在对齐之前。
- *   2) 对齐逻辑跑在 20kHz 中断内，其角度源 KTH7823_Angle_Rad 由 TIM3 中断(10kHz)
- *      独立刷新，本阻塞循环无需再手动调用编码器更新。
- *   3) 启动序列阻塞约 1.6s（对齐两步），必须持续 HAL_IWDG_Refresh()，否则 IWDG(约1s) 复位。
- *   4) 任何异常（自检告警/对齐超时）仅打印提示，不阻断，最终仍进入 IDLE。
- */
-static void Boot_Sequence_Run(void)
-{
-    UART_SendString("\r\n\r\n===== BOOT SEQUENCE START =====\r\n");
-
-    /* ---- 1) 驱动自检配置：读回配置寄存器 + 检查 STATUS ---- */
-    uint16_t sc = DRV8353_SelfCheck();
-    {
-        char line[256];
-        sprintf(line,
-                "[BOOT] DRV8353 self-check: %s\r\n"
-                "       readback CTRL=0x%03X(exp 0x%03X) HS=0x%03X(exp 0x%03X) LS=0x%03X(exp 0x%03X)\r\n"
-                "                OCP=0x%03X(exp 0x%03X) CSA=0x%03X(exp 0x%03X)\r\n"
-                "                STATUS1=0x%03X STATUS2=0x%03X\r\n",
-                (sc == DRV8353_SC_OK) ? "PASS" : "WARN",
-                drv8353_selfcheck.driver_ctrl, (DRV8353_PWM_MODE_3X | DRV8353_OCP_ACT_ALL),
-                drv8353_selfcheck.gate_hs,     DRV8353_DRIVE_STRENGTH_HS,
-                drv8353_selfcheck.gate_ls,     DRV8353_DRIVE_STRENGTH_LS,
-                drv8353_selfcheck.ocp_ctrl,    DRV8353_OCP_CONFIG,
-                drv8353_selfcheck.csa_ctrl,    DRV8353_CSA_DISABLE,
-                drv8353_selfcheck.status1,     drv8353_selfcheck.status2);
-        UART_SendString(line);
-
-        if (sc & 0x001F) {
-            UART_SendString("[BOOT] WARN: DRV8353 config readback mismatch\r\n");
-        }
-        if (sc & DRV8353_SC_STATUS1_FAULT) {
-            UART_SendString("[BOOT] WARN: DRV8353 STATUS1 reports fault bits\r\n");
-        }
-        if (sc & DRV8353_SC_STATUS2_FAULT) {
-            UART_SendString("[BOOT] WARN: DRV8353 STATUS2 reports fault bits\r\n");
-        }
-    }
-
-    /* ---- 2) 参数校验打印 ---- */
-    UART_PrintSystemReport();
-
-    /* ---- 3) 自动对齐（可用 AUTO_ALIGN_ON_BOOT 关闭）---- */
-#if (AUTO_ALIGN_ON_BOOT)
-    UART_SendString("[BOOT] Auto-align start (two-step, ~1.6s)...\r\n");
-    FOC_SetMode(FOC_STATE_ALIGN);        // 触发对齐（内部会重置对齐步骤与窗口累积）
-
-    {
-        uint32_t t0 = HAL_GetTick();
-        while (foc.mode == FOC_STATE_ALIGN) {
-            /* 对齐角度源由 TIM3 中断(10kHz)独立刷新，此处无需手动读取 SPI */
-            /* 对齐完成时置 pending，由既有函数完成格式化上报（含 delta 过小/过大 WARN） */
-            UART_ReportAlignResult();
-            UART_Tx_Poll();
-            HAL_IWDG_Refresh(&hiwdg);    // 阻塞期间喂狗，防 IWDG(约1s) 复位
-
-            if ((HAL_GetTick() - t0) > BOOT_ALIGN_TIMEOUT_MS) {
-                UART_SendString("[BOOT] WARN: auto-align TIMEOUT, abort\r\n");
-                break;
-            }
-            DWT_DelayMs(1);
-        }
-        UART_ReportAlignResult();        // 兜底：确保最后一步结果被上报
-    }
-#else
-    UART_SendString("[BOOT] Auto-align disabled (AUTO_ALIGN_ON_BOOT=0)\r\n");
-#endif
-
-    /* ---- 4) 进入 IDLE：停止输出、清零给定，等待指令 ---- */
-    manual_voltage    = 0.0f;
-    manual_speed      = 0.0f;
-    foc.target_speed  = 0.0f;
-    foc.target_torque = 0.0f;
-    FOC_SetMode(FOC_STATE_IDLE);
-    LED_Update();                        // 立即刷新 LED 到 IDLE 指示（熄灭）
-
-    UART_SendString("[BOOT] Sequence complete. Entered IDLE, waiting for UART commands.\r\n");
-    UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
-}
+/* 上电自动执行启动序列已迁移至 motor_control.c（MotorControl_BootSequence） */
 
 /* USER CODE END 0 */
 
@@ -234,8 +148,7 @@ int main(void)
 	UART_Cmd_Init();
 	MotorControl_Init();
 
-	// 上电自动执行：驱动自检配置 → 参数校验打印 → 自动对齐 → 进入 IDLE 等待串口/CAN 指令
-	Boot_Sequence_Run();
+	MotorControl_BootSequence();   // 上电自动执行启动序列
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -249,11 +162,20 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-		// 调试监控快照：集中刷新关键运行变量到 dbg，供 KEIL Watch 观察（放最前，捕捉上报清零前的 fault_code）
+		// 故障恢复：20kHz 中断只推到 FOC_RECOVER_REQ，本函数执行阻塞式 DRV8353_Recover()
+		FOC_FaultRecoverProcess();
+
+		// 调试监控快照：集中刷新关键运行变量到 dbg，供 KEIL Watch 观察
 		DBG_Monitor_Update();
+
+		// [TEST] 故障/状态自动串口上报（删除本模块时一并删除本行）
+		UartLog_Poll();
 		
 		// LED 状态指示：正常运行常亮，故障低频闪烁
 		LED_Update();
+
+		// 上电自检硬件错误(锁死)指示：覆盖 IDLE 熄灭，闪烁提示需检修
+		MotorControl_BootErrorLed();
 
 		// 故障监测：仅做诊断上报，真正的退避/恢复由 FOC_Update 顶部的FOC_STATE_FAULT 状态机接管
     // （fault_triggered 在此不清除，留给 FOC 消费）
@@ -318,7 +240,6 @@ int main(void)
 		// 自动实时上报状态
 //		UART_SendStatus();
 
-		// 对齐完成结果上报（对齐在 20kHz 控制中断里只置标志，这里做格式化+发送）
 		UART_ReportAlignResult();
 
 		// 非阻塞发送兜底：发送链路异常（HAL 启动失败/出错）时恢复，正常无开销

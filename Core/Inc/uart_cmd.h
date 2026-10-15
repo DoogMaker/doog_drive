@@ -41,4 +41,10 @@ void UART_ReportAlignResult(void);
 // 上电参数校验打印（启动序列调用）：逐项输出 PID/限位/阈值/母线电压/温度/关键常量及 PASS/WARN
 void UART_PrintSystemReport(void);
 
+// [TEST] 故障/状态自动串口上报（主循环调用）；删除本模块时一并删除本行
+void UartLog_Poll(void);
+
+// [TEST] "恢复被挡"记录（FOC 在 fault_recover_blocked() 返回 1 时调用）；删除本模块时一并删除本行
+void UartLog_RecoverBlocked(void);
+
 #endif

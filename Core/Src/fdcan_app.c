@@ -4,16 +4,12 @@
 #include "sense.h"
 #include "foc.h"
 #include "Protect.h"
+#include "motor_control.h"   // MotorControl_CommandGate（硬件错误锁死门控）
 #include "math.h"
 
 extern volatile float bus_voltage;  
 
-// ==================== 接收队列（中断生产 / 主循环消费，单生产者单消费者无锁环形缓冲）====================
-// 为什么需要队列：早期实现只有"一份缓存 + 一个 flag"，CAN 中断每收到一帧就整份覆盖。
-// 上位机连发多条命令（典型：0x03 切模式 + 0x02 设电压 + 0x07 转角度）时，
-// 主循环还没处理就被后一帧覆盖，前面几条被静默丢弃，甚至出现
-// "0x03 丢了、只剩 0x07，而非开环下 0x07 被忽略 → 电机毫无反应"的错序现象。
-// 现在：中断把每一帧放进队列，主循环一次把积压帧按到达顺序全部处理完，突发指令不再丢失。
+// 接收队列（中断生产 / 主循环消费，单生产者单消费者无锁环形缓冲）
 #define FDCAN_RX_QUEUE_SIZE   16                          // 队列深度，必须是 2 的幂
 #define FDCAN_RX_QUEUE_MASK   (FDCAN_RX_QUEUE_SIZE - 1)
 
@@ -292,6 +288,12 @@ static void FDCAN_HandleCommand(const FDCAN_RxFrame_t *msg)
     int16_t val_int;                       // 用于接收 16 位数值
     float val_float;
 
+    // 控制命令(0x01~0x07)门控：上电自检硬件错误锁死后拒绝执行
+    // （心跳/查询 0x08/0x09/0x10 不受影响，锁死后仍可诊断）
+    if (cmd >= CMD_SET_SPEED && cmd <= CMD_SET_OPENLOOP_ANGLE_HOLD) {
+        if (!MotorControl_CommandGate()) return;
+    }
+
     switch (cmd) {
         case CMD_SET_SPEED:
             // 开环门控：速度指令仅在开环模式生效，其余模式静默忽略（不驱动电机、不回反馈）
@@ -318,15 +320,16 @@ static void FDCAN_HandleCommand(const FDCAN_RxFrame_t *msg)
             break;
             
         case CMD_SET_MODE:
-            // 控制模式切换 (数据: byte1)
-            // 0: IDLE, 1: OPENLOOP, 2: CLOSEDLOOP(速度), 3: ALIGN, 4: CLOSEDLOOP(位置), 5: CLOSEDLOOP(力矩)
+            // 控制模式切换 (数据: byte1)，编号直接等于 FOC_State_t 枚举值
+            // 0: IDLE, 1: OPENLOOP, 2: ALIGN, 3: TORQUE, 4: SPEED, 5: POSITION
+            // 6(FAULT) 不允许上位机设置（故障只能由保护触发）
             switch (msg->data[1]) {
-                case 0: FOC_SetMode(FOC_STATE_IDLE); break;
+                case 0: FOC_SetMode(FOC_STATE_IDLE);     break;
                 case 1: FOC_SetMode(FOC_STATE_OPENLOOP); break;
-                case 2: FOC_SetMode(FOC_STATE_CLOSEDLOOP); FOC_SetClosedLoopMode(CL_MODE_SPEED); break;
-                case 3: FOC_SetMode(FOC_STATE_ALIGN); break;
-                case 4: FOC_SetMode(FOC_STATE_CLOSEDLOOP); FOC_SetClosedLoopMode(CL_MODE_POSITION); break;
-                case 5: FOC_SetMode(FOC_STATE_CLOSEDLOOP); FOC_SetClosedLoopMode(CL_MODE_TORQUE); break;
+                case 2: FOC_SetMode(FOC_STATE_ALIGN);    break;
+                case 3: FOC_SetMode(FOC_STATE_TORQUE);   break;
+                case 4: FOC_SetMode(FOC_STATE_SPEED);    break;
+                case 5: FOC_SetMode(FOC_STATE_POSITION); break;
                 default: break;
             }
             break;
@@ -429,7 +432,7 @@ void FDCAN_App_Process(void)
  *        Byte0: 系统状态 (0:空闲/就绪, 1:运行, 2:故障)
  *        Byte1-2: 当前转速 (int16, 单位 rad/s * 10)
  *        Byte3-4: A相电流 (int16, 单位 A * 100)
- *        Byte5: 当前控制模式
+ *        Byte5: 当前控制模式（对外统一编号，与 0x03 命令 byte1 一致：0=IDLE 1=OPENLOOP 2=ALIGN 3=TORQUE 4=SPEED 5=POSITION 6=FAULT）
  *        Byte6-7: 母线电压 (int16, 单位 V * 10)
  */
 void FDCAN_SendStatus(void)
@@ -453,7 +456,8 @@ void FDCAN_SendStatus(void)
     tx_data[3] = cur_int & 0xFF;
     tx_data[4] = (cur_int >> 8) & 0xFF;
     
-    // 控制模式
+    // 控制模式：枚举值即对外统一编号（与 0x03 命令 byte1 完全一致）：
+    //   0=IDLE 1=OPENLOOP 2=ALIGN 3=TORQUE 4=SPEED 5=POSITION 6=FAULT
     tx_data[5] = (uint8_t)foc.mode;
     
     // 母线电压 (V * 10)，读取真实采样值

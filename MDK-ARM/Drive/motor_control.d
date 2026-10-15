@@ -34,4 +34,5 @@ drive/motor_control.o: ..\Core\Src\motor_control.c \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
   ..\Core\Inc\spi.h ..\Core\Inc\KTH7823.h ..\Core\Inc\encoder2.h \
   ..\Core\Inc\foc.h ..\Core\Inc\pid.h ..\Core\Inc\drv8353.h \
-  ..\Core\Inc\sense.h ..\Core\Inc\tim.h ..\Core\Inc\adc.h
+  ..\Core\Inc\sense.h ..\Core\Inc\tim.h ..\Core\Inc\adc.h \
+  ..\Core\Inc\iwdg.h ..\Core\Inc\dwt_delay.h ..\Core\Inc\uart_cmd.h

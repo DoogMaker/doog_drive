@@ -20,6 +20,15 @@
 #define FAULT_RETRY_DELAY     2000    // 基础冷却时间(ms)，每次重试按 2^(n-1) 增长
 #define FAULT_RETRY_DELAY_MAX 16000   // 退避冷却时间上限(ms)，防止等待过久
 
+// 故障恢复握手状态（FOC_State.fault_recover_state）
+// 为什么要握手：DRV8353_Recover() 是阻塞约 20ms 的忙等序列（SPI + DWT_DelayMs），
+// 绝不能在 20kHz 控制中断里执行，故拆成"中断判定 → 主循环执行 → 中断收尾"两步。
+// 模式切换（切回开环）仍由中断统一完成，保证 foc.mode 的状态迁移只在单一上下文里发生。
+#define FOC_RECOVER_IDLE 0   // 无恢复动作
+#define FOC_RECOVER_REQ  1   // 中断已判定可恢复，等主循环执行 DRV8353_Recover()
+#define FOC_RECOVER_BUSY 2   // 主循环正在执行阻塞式 DRV8353_Recover()
+#define FOC_RECOVER_DONE 3   // 主循环已完成硬件恢复，等中断切回开环并收尾
+
 // 故障诊断码（主循环上报用）：0=无故障，其余为已触发并锁存的故障类型
 #define FAULT_CODE_NONE          0
 #define FAULT_CODE_HARDWARE      1   // DRV8353 nFAULT 硬件故障（具体位见 fault_status1/2）
@@ -43,12 +52,7 @@
 #define FOC_VF_GAIN     0.0725f   // V/(rad/s)，≈ 额定 V/f
 #define FOC_VOLT_BOOST  0.2f     // 低速升压 (V)，克服 R 压降/静摩擦
 
-// ==================== 开环"转到指定输出端角度 + 到位悬停保持"参数 ====================
-// CAN 0x07：按当前开环方式转到指定减速器输出端角度，到位后进入"电弹簧"悬停保持。
-// 悬停**不计时自动释放**，会一直保持，直到满足以下任一释放条件（释放后电压、速度归零）：
-//   ① 上位机发送 0x02 且电压为 0（v=0）——显式释放；
-//   ② 离开开环模式（0x03 切模式、保护停机）——自动中止并释放。
-// 完整说明见 docs/CAN上位机控制指令说明.md。
+// 开环"转到指定输出端角度 + 到位悬停保持"参数
 #define GEAR_RATIO_OUT2MOTOR        12.5f   // 减速器输出端 -> 电机轴 的减速比
 #define FOC_OL_DEFAULT_SPEED        5.0f    // 未设转速时的默认开环转速 (rad/s，电机轴)
 #define FOC_OL_DEFAULT_VOLTAGE      0.6f    // 未设电压时的默认开环电压 (V)
@@ -62,23 +66,16 @@
 #define FOC_OL_RAD2DEG              57.29577951308f  // rad -> 度
 #define FOC_OL_TWO_PI               6.28318530718f   // 2π
 
-// FOC状态机
+// FOC状态机：枚举值即对外统一模式编号（0..6）
 typedef enum {
-    FOC_STATE_IDLE,
-    FOC_STATE_ALIGN,
-    FOC_STATE_OPENLOOP,
-    FOC_STATE_CLOSEDLOOP,    // 闭环（内部按 closedloop_mode 分力矩/速度/位置级联）
-    FOC_STATE_FAULT          // 故障退避：停输出、倒计时冷却，到点后由 FOC_Update 自动恢复
+    FOC_STATE_IDLE     = 0,   // 空闲
+    FOC_STATE_OPENLOOP = 1,   // 开环
+    FOC_STATE_ALIGN    = 2,   // 对齐
+    FOC_STATE_TORQUE   = 3,   // 闭环力矩（仅电流环，目标 Iq 直接给定）
+    FOC_STATE_SPEED    = 4,   // 闭环速度（速度环→电流环）
+    FOC_STATE_POSITION = 5,   // 闭环位置（位置环→速度环→电流环）
+    FOC_STATE_FAULT    = 6,   // 故障退避：停输出、倒计时冷却，到点后由 FOC_Update 自动恢复
 } FOC_State_t;
-
-// 闭环控制模式（级联深度）：三层环始终级联存在，值越大级联越深。
-//   位置环(外) → 速度环(中) → 电流环/力矩环(内)
-// 本枚举决定"目标值从哪一层注入"，不是三选一的割裂模式：
-typedef enum {
-    CL_MODE_TORQUE   = 0,  // 力矩环（最内层注入）：目标 Iq 直接给定，位置/速度环旁路
-    CL_MODE_SPEED    = 1,  // 速度环（中层注入）：目标速度直接给定，速度环→电流环
-    CL_MODE_POSITION = 2,  // 位置环（最外层注入）：位置环→速度环→电流环 全链路级联
-} FOC_ClosedLoopMode_t;
 
 // 开环"运动/悬停保持"子状态（FOC_State.openloop_move_state，也直接作为 0x300 状态帧 byte0）
 typedef enum {
@@ -119,7 +116,6 @@ typedef struct {
                                      //     与 ALIGN 磁力定位同形态；0 = 正常开环（角度按 target_speed_ramp 积分）
                                      //     所有 FOC_SetMode 调用都会清零本标志（含 CAN/串口/启动序列）
 	  FOC_State_t mode;		// 当前工作状态
-    FOC_ClosedLoopMode_t closedloop_mode;   // 闭环级联深度（力矩/速度/位置）
     // 开环"转到指定输出端角度 + 悬停保持"子状态机（由 FOC_Update 20kHz 中断非阻塞推进）
     uint8_t openloop_move_state;      // FOC_OpenLoopMoveState_t：0=IDLE 1=RUN 2=HOLD 3=PULL，直接作为状态帧 byte0
     uint8_t openloop_move_stop_req;   // 1 = 请求中止"运动/悬停"动作（主循环置位，20kHz 中断原子消费并释放）
@@ -134,6 +130,8 @@ typedef struct {
     uint8_t  fault_retry_cnt;   // 连续故障次数（指数退避）
     uint32_t fault_recover_time;// 计划恢复时间戳(ms)，由 HAL_GetTick() 比较
     uint32_t last_recover_tick; // 最近一次故障恢复时刻(ms)，稳定运行超时后据此重置 fault_retry_cnt
+    uint8_t  fault_recover_state; // 故障恢复握手状态：FOC_RECOVER_IDLE/REQ/BUSY/DONE
+                                  //   （中断侧跑 0→1 与 3→0，主循环只跑 1→2→3；见 FOC_FaultRecoverProcess）
 } FOC_State;
 
 // 对齐定位
@@ -174,6 +172,7 @@ extern float pos_error_limit;
 
 void FOC_Init(void);
 void FOC_Update(void);
+void FOC_FaultRecoverProcess(void);   // 故障恢复执行体（主循环调用）：仅此地执行阻塞式 DRV8353_Recover()
 void LED_Update(void);   // LED 状态指示（运行常亮，待机熄灭，故障闪烁，主循环调用）
 
 void FOC_Clark(void);
@@ -181,8 +180,7 @@ void FOC_Park(void);
 void FOC_InversePark(void);
 void FOC_SVPWM(void);
 
-void FOC_SetMode(FOC_State_t mode);
-void FOC_SetClosedLoopMode(FOC_ClosedLoopMode_t mode);  // 设置闭环级联深度（力矩/速度/位置）
+void FOC_SetMode(FOC_State_t mode);   // 模式枚举值即对外统一编号：0=IDLE 1=OPENLOOP 2=ALIGN 3=TORQUE 4=SPEED 5=POSITION 6=FAULT
 void FOC_SetOpenLoopVoltage(float voltage);
 void FOC_StartOpenLoopMoveHold(float out_rad);    // 开环转到输出端角度 out_rad(rad，0 忽略)并悬停保持
 void FOC_StopOpenLoopMoveHold(void);              // 中止"转角度/悬停"动作并释放（电压、速度归零）

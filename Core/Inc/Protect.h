@@ -73,6 +73,13 @@
 #define OVERSPEED_THRESHOLD   230.0f   // 超速停机阈值 (rad/s)，≈1.2×电机轴额定
 #define OVERSPEED_RECOVER     200.0f   // 恢复阈值 (rad/s)，≈1.05×额定，滞回 30
 
+// 超速"连续 N 拍确认"：抑制编码器解包裹跳变导致的单拍速度尖峰误触发。
+// 依据：速度低通 α=SPEED_FILTER_ALPHA(0.15)、刷新 10kHz；最坏单次跳变(Δ=π → 原始 31416 rad/s)
+// 经滤波后约 4712 rad/s，按 ×0.85/样衰减，需 ≈19 个速度样点(≈1.9ms) 才回落到 230 以下；
+// Protect 在 20kHz(50µs/拍) 巡检，故约 38 拍读数仍超阈 → 取 50 拍(≈2.5ms) 留余量即可滤掉。
+// 真实飞车会持续超阈，2.5ms 的确认延时相对机械时间常数可忽略。
+#define OVERSPEED_CONFIRM_TICKS  50u   // 连续超阈拍数（20kHz 下 ≈2.5ms）
+
 // 关闭三路 PWM 输出但保持 TIM1 计数（供所有保护分支/故障回调统一调用）
 void Protect_StopPWM(void);
 

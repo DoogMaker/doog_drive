@@ -6,6 +6,9 @@
 #include "Protect.h"
 #include "dbg_monitor.h"
 
+void UartLog_FaultRecord(void);      // [TEST] 定义于 uart_cmd.c（故障记录入队）；删除本模块时一并删除本行
+void UartLog_RecoverBlocked(void);   // [TEST] 定义于 uart_cmd.c（恢复被挡诊断）；删除本模块时一并删除本行
+
 
 #define ALIGN_VOLTAGE       0.6f    // 对齐电压 (V)，用于将转子拉到目标位置
 #define ALIGN_STEP_DELAY    800     // 每步对齐持续时间 (ms)
@@ -52,14 +55,7 @@ static uint32_t ol_move_t0      = 0;      // 运动阶段起始时刻 (ms)，用
 static uint32_t ol_pull_t0      = 0;      // 本次回拉起始时刻 (ms)
 static float    ol_pull_speed   = 0.0f;   // 本次回拉的低速给定 (rad/s，带符号)，回拉期间每拍重申
 
-/* ---------------- 对齐：末尾窗口平均定位（替代单点采样） ----------------
- * 单点采样对"转子残余振荡"和"编码器噪声"都极其敏感：励磁电压越高转子冲得越猛，
- * 800ms 采样那一刻越可能撞上振荡相位，表现为 |delta| 忽大忽小（0.8V 实测就是如此）。
- * 这里改为：在每步末尾的一个时间窗口内持续累积角度的 sin/cos，最后取 atan2 平均。
- *   - 振荡周期远小于窗口长度 -> 直接平均掉；
- *   - 上千个样点平均 -> 噪声降低 √N 倍（等效分辨率提升）；
- *   - 累积 sin/cos 而不是角度本身 -> 天然不受 0~2π 环绕影响。
- */
+// 对齐：末尾窗口平均定位（替代单点采样）
 static float    align_sum_sin     = 0.0f;
 static float    align_sum_cos     = 0.0f;
 static uint32_t align_sum_cnt     = 0;
@@ -155,10 +151,9 @@ void FOC_Init(void)
 	
 	//设置 FOC 初始状态（空闲，全部归零）
 	foc.mode = FOC_STATE_IDLE;    // 默认空闲模式：上电无输出（安全），由启动序列/上位机指令切换
-	foc.closedloop_mode = CL_MODE_SPEED;   // 闭环默认速度子模式
 	foc.target_speed = 0.0f;
 	foc.target_torque = 0.0f;
-	foc.torque_constant = 0.1f;   // Kt 占位值，必须按电机实测设置（Nm/A）；暂未知时可设 1.0 让转矩值等于 Iq(A)
+	foc.torque_constant = 1.65f;   // 电机实测扭矩系数（Nm/A）
 	foc.target_speed_ramp = 0.0f;     // 斜坡实际值从 0 起步
 	foc.speed_ramp_rate = FOC_SPEED_RAMP_RATE;
 	foc.openloop_voltage = 0.0f;    // 初始电压为 0，电机不转
@@ -475,6 +470,42 @@ void FOC_StopOpenLoopMoveHold(void)
 	foc.openloop_move_stop_req = 1;
 }
 
+// 故障退避冷却时间：指数退避，1 次→FAULT_RETRY_DELAY，每次翻倍，封顶 FAULT_RETRY_DELAY_MAX
+static uint32_t fault_backoff_delay(uint8_t retry_cnt)
+{
+	uint32_t cooldown = FAULT_RETRY_DELAY;
+	for (uint8_t i = 1; i < retry_cnt; i++) {
+		cooldown <<= 1;
+		if (cooldown > FAULT_RETRY_DELAY_MAX) return FAULT_RETRY_DELAY_MAX;
+	}
+	return cooldown;
+}
+
+// 故障恢复前的安全条件判定（中断内的冷却判定 与 主循环执行前的复检 共用同一套判据）
+//   retval 1 = 条件未满足，不可恢复，并经 *recheck_delay 返回建议的重检延时(ms)
+//   retval 0 = 温度/母线电压/转速/I²t 四项全部满足，允许恢复
+static uint8_t fault_recover_blocked(uint32_t *recheck_delay)
+{
+	if (ntc_temperature > OVERTEMP_RECOVER) {
+		*recheck_delay = OVERTEMP_RECHECK_DELAY;
+		return 1;
+	}
+	if (bus_voltage > BUS_OVERVOLTAGE_RECOVER ||
+	    bus_voltage < BUS_UNDERVOLTAGE_RECOVER) {
+		*recheck_delay = BUS_VOLTAGE_RECHECK_DELAY;
+		return 1;
+	}
+	if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_RECOVER) {
+		*recheck_delay = BUS_VOLTAGE_RECHECK_DELAY;
+		return 1;
+	}
+	if (i2t_accum > I2T_RESET_THRESHOLD) {
+		*recheck_delay = I2T_RECHECK_DELAY;
+		return 1;
+	}
+	return 0;
+}
+
 // FOC 核心更新函数
 void FOC_Update(void)
 {
@@ -487,20 +518,26 @@ void FOC_Update(void)
 	// ---- 故障拦截：任意保护触发即进入 FAULT 状态（非阻塞退避）----
 	if (fault_triggered) {
 		fault_triggered = 0;
+		UartLog_FaultRecord();   // [TEST] 记录本次触发的故障码/状态（删除本模块时一并删除本行）
+		// 无条件作废尚未完成的恢复握手：DRV8353_Recover() 已挪到主循环执行，
+		// "中断判定可恢复"到"主循环执行完/中断收尾"之间存在间隔，期间任何新故障都说明
+		// 故障源未排除，必须放弃本次恢复。主循环据此在 Recover() 返回后立刻重新关断驱动。
+		foc.fault_recover_state = FOC_RECOVER_IDLE;
 		if (foc.mode != FOC_STATE_FAULT) {
 			foc.mode = FOC_STATE_FAULT;
 			foc.fault_retry_cnt++;
 			// 指数退避：1次→2s, 2次→4s, 3次→8s ... 封顶 16s
-			uint32_t cooldown = FAULT_RETRY_DELAY;
-			for (uint8_t i = 1; i < foc.fault_retry_cnt; i++) {
-				cooldown <<= 1;
-				if (cooldown > FAULT_RETRY_DELAY_MAX) { cooldown = FAULT_RETRY_DELAY_MAX; break; }
-			}
-			foc.fault_recover_time = HAL_GetTick() + cooldown;
+			foc.fault_recover_time = HAL_GetTick() + fault_backoff_delay(foc.fault_retry_cnt);
 			// 立即停输出（PWM 已在 Protect 里被 Disable/Stop，这里双重保险）
 			TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
 			Run_OFF();                      // 进入故障先熄灭，作为闪烁起点
 			led_blink_tick = HAL_GetTick(); // 重置闪烁计时基准
+		} else {
+			// 已在 FAULT 中又触发故障：一律截断当前冷却并按新的连续故障次数重新退避。
+			// 覆盖两种情形：①冷却期间 nFAULT 反复抖动；②恢复请求/硬件恢复刚完成、
+			// 模式尚未切回时又报故障——后者若不重新退避，会在下一次判定时立刻再次恢复，形成冲击循环。
+			foc.fault_retry_cnt++;
+			foc.fault_recover_time = HAL_GetTick() + fault_backoff_delay(foc.fault_retry_cnt);
 		}
 	}
 
@@ -550,7 +587,7 @@ void FOC_Update(void)
 	FOC_Clark();
 	
 	#if (FOC_CLOSEDLOOP_ENABLE == 0)	
-	if (foc.mode == FOC_STATE_CLOSEDLOOP) {
+	if (foc.mode == FOC_STATE_SPEED || foc.mode == FOC_STATE_POSITION || foc.mode == FOC_STATE_TORQUE) {
 		FOC_SetMode(FOC_STATE_OPENLOOP);   // 经统一入口切回：重置 PID + 对齐开环角度/清零电压
 	}
 	#endif
@@ -651,12 +688,15 @@ void FOC_Update(void)
 			foc.Vd = 0.0f;
 			break;
             
-		case FOC_STATE_CLOSEDLOOP://闭环模式：位置环→速度环→电流环 三级联（按 closedloop_mode 决定注入深度）
+		case FOC_STATE_TORQUE:    // 闭环：力矩（仅电流环）
+		case FOC_STATE_SPEED:     // 闭环：速度（速度环→电流环）
+		case FOC_STATE_POSITION:  // 闭环：位置（位置环→速度环→电流环）
+		{   // 闭环三态按深度递增，直接用 foc.mode 比较决定"目标值从哪一层注入"
 			// ★ 角度源必须用"未滤波"的 KTH7823_Angle_Multiturn：
 			//   KTH7823_Angle_Rad 是 sin/cos 一阶低通(α=0.1 @主循环~830Hz)的输出，
 			//   等效群延迟约 12ms —— 10rad/s 时电角度滞后约 145°，闭环必然失控。
 			//   Multiturn 是原始累积角度（连续无界，无需解环绕）；转子静止时两者相等，
-			//   所以 mode=3 对齐得到的 encoder_offset 在本角度空间下同样有效。
+			//   所以 ALIGN(2) 对齐得到的 encoder_offset 在本角度空间下同样有效。
 			mechanical_angle = (KTH7823_Angle_Multiturn - encoder_offset) * encoder_direction;
 			// 电角度 = 机械角度 × 极对数
 			foc.angle = mechanical_angle * MOTOR_POLE_PAIRS;
@@ -669,8 +709,8 @@ void FOC_Update(void)
 			// ===== 级联流水线：位置环(外) → 速度环(中) → 电流环(内)，三层数据单向流动 =====
 			float speed_ref;
 
-			// 第 1 层：位置环（最外层）。closedloop_mode >= POSITION 时，位置环输出作为速度环目标
-			if (foc.closedloop_mode >= CL_MODE_POSITION) {
+			// 第 1 层：位置环（最外层）。仅位置模式启用（POSITION 深度最高）
+			if (foc.mode >= FOC_STATE_POSITION) {
 				foc.position_error = foc.target_position - Encoder2_Angle_Multiturn;
 				speed_ref = PID_Calculate(&pid_position,
 				                          foc.target_position,
@@ -684,8 +724,8 @@ void FOC_Update(void)
 				speed_ref = foc.target_speed_ramp;
 			}
 
-			// 第 2 层：速度环（中层）。closedloop_mode >= SPEED 时启用；力矩模式直接给定 Iq 旁路速度环
-			if (foc.closedloop_mode >= CL_MODE_SPEED) {
+			// 第 2 层：速度环（中层）。速度/位置启用(>= SPEED)；力矩模式直接给定 Iq 旁路速度环
+			if (foc.mode >= FOC_STATE_SPEED) {
 				foc.target_Iq = PID_Calculate(&pid_speed, speed_ref, foc.speed, control_dt);
 			} else {
 				// 力矩模式：目标 Iq 由力矩直接换算（T = Kt × Iq）
@@ -696,28 +736,36 @@ void FOC_Update(void)
 			foc.Vq = PID_Calculate(&pid_iq, foc.target_Iq, foc.Iq, control_dt);
 			foc.Vd = PID_Calculate(&pid_id, 0.0f, foc.Id, control_dt);  // Id 目标 = 0
 			break;
+		}
             
-		case FOC_STATE_FAULT:// 故障退避：停输出，倒计时到点后自动恢复开环
+		case FOC_STATE_FAULT:// 故障退避：停输出，倒计时到点后请求主循环执行硬件恢复
 			foc.Vd = 0.0f;
 			foc.Vq = 0.0f;
 			TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
-			if (HAL_GetTick() >= foc.fault_recover_time) {
-				// 恢复前需同时满足：温度正常 + 母线电压安全 + 转速已回落（滞回防震荡）
-				if (ntc_temperature > OVERTEMP_RECOVER) {
-					foc.fault_recover_time = HAL_GetTick() + OVERTEMP_RECHECK_DELAY;
-				} else if (bus_voltage > BUS_OVERVOLTAGE_RECOVER ||
-				           bus_voltage < BUS_UNDERVOLTAGE_RECOVER) {
-					foc.fault_recover_time = HAL_GetTick() + BUS_VOLTAGE_RECHECK_DELAY;
-				} else if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_RECOVER) {
-					foc.fault_recover_time = HAL_GetTick() + BUS_VOLTAGE_RECHECK_DELAY;
-				} else if (i2t_accum > I2T_RESET_THRESHOLD) {
-					foc.fault_recover_time = HAL_GetTick() + I2T_RECHECK_DELAY;
+
+			if (foc.fault_recover_state == FOC_RECOVER_DONE) {
+				// 主循环已完成 DRV8353_Recover()（清故障 + 重写配置 + 使能 + 重启三路 PWM），
+				// 由中断统一完成模式收尾：切回开环（统一斜坡缓启动，不会瞬间满电流）。
+				// 放在中断侧是为了让 foc.mode 的状态迁移只发生在单一上下文，避免与故障拦截互相覆盖。
+				foc.fault_recover_state = FOC_RECOVER_IDLE;
+				FOC_SetMode(FOC_STATE_OPENLOOP);
+				foc.last_recover_tick = HAL_GetTick();   // 记录恢复时刻，供稳定运行后重置计数
+				Run_ON();
+				return;  // 本拍不调制，下一拍起按开环正常输出
+			}
+
+			if (foc.fault_recover_state == FOC_RECOVER_IDLE &&
+			    HAL_GetTick() >= foc.fault_recover_time) {
+				uint32_t recheck = 0;
+				// 恢复前需同时满足：温度正常 + 母线电压安全 + 转速已回落 + I²t 已回落（滞回防震荡）
+				if (fault_recover_blocked(&recheck)) {
+					UartLog_RecoverBlocked();   // [TEST] 记录"恢复被挡"判据（删除本模块时一并删除本行）
+					foc.fault_recover_time = HAL_GetTick() + recheck;
 				} else {
-					// 冷却结束且电压安全且转速正常：恢复驱动 + 切回开环（斜坡缓启动，不会瞬间满电流）
-					DRV8353_Recover();
-					FOC_SetMode(FOC_STATE_OPENLOOP);
-					foc.last_recover_tick = HAL_GetTick();   // 记录恢复时刻，供稳定运行后重置计数
-					Run_ON();
+					// 只置握手状态：DRV8353_Recover() 内含 SPI 通信 + 多次 DWT_DelayMs 忙等，
+					// 累计阻塞约 20ms（= 20kHz 控制周期的 400 拍），绝不能在中断里执行；
+					// 由主循环的 FOC_FaultRecoverProcess() 完成。
+					foc.fault_recover_state = FOC_RECOVER_REQ;
 				}
 			}
 			return;  // FAULT 期间不执行 SVPWM/占空比更新
@@ -762,16 +810,51 @@ void FOC_Update(void)
 	TIM1->CCR3 = (uint32_t)(Tc * arr);
 }
 
+// 故障恢复执行体（主循环调用，约 1kHz）
+void FOC_FaultRecoverProcess(void)
+{
+	if (foc.fault_recover_state != FOC_RECOVER_REQ) return;
+
+	// 复检（与中断内同一套判据）：从"中断判定可恢复"到本函数执行之间又过了若干毫秒，
+	// 温度/母线电压/转速/I²t 任一超限则作废请求，交回中断重新计时。
+	uint32_t recheck = 0;
+	if (fault_recover_blocked(&recheck)) {
+		UartLog_RecoverBlocked();   // [TEST] 记录"恢复被挡"判据（删除本模块时一并删除本行）
+		foc.fault_recover_state = FOC_RECOVER_IDLE;
+		foc.fault_recover_time  = HAL_GetTick() + recheck;
+		return;
+	}
+
+	foc.fault_recover_state = FOC_RECOVER_BUSY;
+	DRV8353_Recover();   // 阻塞约 20ms：清故障 + 重写全部配置 + 使能 + 重启三路 PWM
+
+	if (foc.fault_recover_state != FOC_RECOVER_BUSY) {
+		// 恢复过程中又出现故障（中断的故障拦截已把状态置回 IDLE 并重新退避）：
+		// 立即重新关断。DRV8353_Recover() 刚把 EN/PWM 控制脚拉高，不显式关一次会停留在
+		// "驱动使能 + FAULT 态 0 占空比"（三相下桥常通、电机被短接制动）的异常状态。
+		// foc.mode 保持 FAULT，由中断继续退避，无需在此改动模式。
+		DRV8353_Disable();
+		Protect_StopPWM();
+		TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
+		return;
+	}
+
+	// 硬件恢复完成：置 DONE，交回中断做模式收尾（切回开环 + 记录 last_recover_tick + Run_ON）
+	foc.fault_recover_state = FOC_RECOVER_DONE;
+}
+
 // 切换 FOC 控制模式
 void FOC_SetMode(FOC_State_t mode)
 {
-	// 任意模式切换（含串口 mode=/ang=、CAN、启动序列）都退出开环保持，
-	// 避免电弹簧状态残留在后续模式里造成意外通电；放在提前返回前，保证同一模式的重复调用也生效。
+	// 任意模式切换（含串口 mode=/ang=、CAN、启动序列）都退出开环保持
 	foc.openloop_hold = 0;
-	// 同时请求中止"开环运动/悬停"状态机：只置中断消费的请求标志，实际释放由 20kHz 控制中断原子完成，
-	// 避免主循环与中断并发写同一状态而相互覆盖（否则释放可能被中断的"重申"复活）。
-	// 注意：绝不动 manual_speed/manual_voltage —— 否则会破坏"先发速度/电压、再切 mode=1"的既有使用顺序。
+	// 请求中止"开环运动/悬停"状态机
 	foc.openloop_move_stop_req = 1;
+
+	// 外部模式指令 = 人工接管：作废尚在排队、等待主循环执行的自动恢复请求
+	if (foc.fault_recover_state == FOC_RECOVER_REQ) {
+		foc.fault_recover_state = FOC_RECOVER_IDLE;
+	}
 
 	if (foc.mode == mode) return;
 
@@ -782,46 +865,30 @@ void FOC_SetMode(FOC_State_t mode)
 	PID_Reset(&pid_position);   // 位置环 PID 也需重置
 
 	if (mode == FOC_STATE_ALIGN) {
-		// 进入对齐必须从第一步重新开始：
-		// 否则中途被打断（再发一次 enable/disable、或触发 FAULT）后 align_step 会停在中间，
-		// 下次 mode=3 从中间步骤续跑，start_angle_raw 是旧值 -> 结果错误且没有任何提示。
 		align_step = ALIGN_STEP_0;
 		align_step_time = 0;
 		align_accum_reset();   // 清空窗口累积，避免上一次的残留样点混入
 	}
 
 	if (mode == FOC_STATE_OPENLOOP) {
-		// 切换到开环时，将开环角度与当前编码器电角度对齐（含方向/零偏，保证闭环↔开环切换连续）
-		// 必须与闭环分支用同一个角度源（未滤波的 Multiturn）：否则闭环→开环那一拍会因
-		// 滤波滞后产生上百度的电角度跳变，造成电流冲击。
 		foc.openloop_angle = (KTH7823_Angle_Multiturn - encoder_offset) * encoder_direction * MOTOR_POLE_PAIRS;
 		// 电压归零，防止冲击
     	foc.openloop_voltage = 0.0f;
 	}
-	foc.mode = mode;
-}
 
-// 设置闭环控制模式（级联深度），仅在 FOC_STATE_CLOSEDLOOP 下有意义
-void FOC_SetClosedLoopMode(FOC_ClosedLoopMode_t mode)
-{
-	if (foc.closedloop_mode == mode) return;
-	foc.closedloop_mode = mode;
-	// 级联深度切换时的平滑处理
-	if (mode >= CL_MODE_POSITION) {
+	// 进入闭环各模式时的平滑初始化
+	if (mode == FOC_STATE_POSITION) {
 		// 进入位置级联：位置目标 = 当前位置（防阶跃冲击），重置位置误差累积
 		foc.target_position = Encoder2_Angle_Multiturn;
 		foc.position_error = 0.0f;
 		foc.pos_err_integral_acc = 0.0f;
 	}
-	if (mode == CL_MODE_TORQUE) {
+	if (mode == FOC_STATE_TORQUE) {
 		// 进入力矩模式：清零目标 Iq/转矩，防止残留 Iq 造成瞬间冲击
 		foc.target_Iq = 0.0f;
 		foc.target_torque = 0.0f;
 	}
-	// 切换级联深度时重置各环积分，避免输出突变
-	PID_Reset(&pid_speed);
-	PID_Reset(&pid_position);
-	PID_Reset(&pid_iq);
+	foc.mode = mode;
 }
 
 // 设置开环模式下的手动电压
@@ -902,7 +969,6 @@ void LED_Update(void)
 
 
 
-
 // ==================== 调试监控快照（临时，可整体删除）====================
 volatile DBG_Monitor_t dbg = {0};   // 监控实例（KEIL Watch 添加 "dbg" 展开查看）
 
@@ -911,7 +977,6 @@ void DBG_Monitor_Update(void)
 {
 	// ---- 运行状态 ----
 	dbg.mode            = (uint8_t)foc.mode;
-	dbg.closedloop_mode = (uint8_t)foc.closedloop_mode;
 	dbg.fault_code      = fault_code;
 	if (fault_code != FAULT_CODE_NONE) {
 		dbg.last_fault_code = fault_code;   // 锁存最近一次故障码，上报清零后仍可查

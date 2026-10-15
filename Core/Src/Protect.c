@@ -41,6 +41,7 @@ float pos_error_limit =  0.05f;     // 默认位置跟随误差 0.05 rad（约 2
 // 继续计数无关，因此这里关断输出后显式补回 CEN，保住控制回路与保护的可观测性。
 void Protect_StopPWM(void)
 {
+	// 软堵转/过流保护：三相合成电流超阈值则关驱动、停 PWM，并置 fault 标志
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
@@ -95,7 +96,7 @@ void Protect_EncoderStallCheck(void)
         fault_code = FAULT_CODE_ENCODER_STALL;  // 锁存软件故障码
         DRV8353_Disable();
         Protect_StopPWM();
-        fault_triggered = 1;
+        fault_triggered = 1;   // 交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机退避恢复
         enc_armed = 0;      // 触发后重新准备
         enc_arm_tick = 0;
     }
@@ -155,7 +156,7 @@ void Protect_OvertempCheck(void)
         fault_code = FAULT_CODE_OVERTEMP;   // 锁存过温故障码（先于 Disable，供主循环上报）
         DRV8353_Disable();
         Protect_StopPWM();
-        fault_triggered = 1;   // 交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机退避恢复
+        fault_triggered = 1;
     }
 }
 
@@ -185,11 +186,11 @@ void Protect_BusVoltageCheck(void)
     }
 }
 
-// 位置跟随误差保护：仅闭环位置级联调用。误差持续超限 POS_ERR_TIMEOUT_TICKS 控制周期则停驱动
-// 注意：此函数由 FOC_Update 的 FOC_STATE_CLOSEDLOOP 位置级联分支内调用，不在其他模式触发。
+// 位置跟随误差保护：仅闭环位置模式调用。误差持续超限 POS_ERR_TIMEOUT_TICKS 控制周期则停驱动
+// 注意：此函数由 FOC_Update 的 FOC_STATE_POSITION 分支内调用，不在其他模式触发。
 void Protect_PositionErrorCheck(void)
 {
-    if (foc.mode != FOC_STATE_CLOSEDLOOP || foc.closedloop_mode < CL_MODE_POSITION) {
+    if (foc.mode != FOC_STATE_POSITION) {
         foc.pos_err_integral_acc = 0.0f;   // 未启用位置级联时清零累计
         return;
     }
@@ -212,7 +213,7 @@ void Protect_PositionErrorCheck(void)
 // 持续 SOFT_LIMIT_TIMEOUT_TICKS 控制周期则停驱动，防止上层控制逻辑失控反复撞限位。
 void Protect_SoftLimitCheck(void)
 {
-    if (foc.mode != FOC_STATE_CLOSEDLOOP || foc.closedloop_mode < CL_MODE_POSITION) {
+    if (foc.mode != FOC_STATE_POSITION) {
         foc.pos_err_integral_acc = 0.0f;
         return;
     }
@@ -234,11 +235,17 @@ void Protect_SoftLimitCheck(void)
 }
 
 // 超速保护
-// 机械角速度绝对值超阈值即停机（正反转均检测）。恢复条件在 FOC_STATE_FAULT 分支内：
-// 速度回落到恢复阈值以下才允许恢复（滞回，防震荡）。
+// 机械角速度绝对值"连续"超阈值 OVERSPEED_CONFIRM_TICKS 拍才停机（正反转均检测），
+// 用于抑制编码器解包裹跳变/差分噪声造成的单拍速度尖峰误触发（判据见 Protect.h）。
+// 恢复条件在 FOC_STATE_FAULT 分支内：速度回落到恢复阈值以下才允许恢复（滞回，防震荡）。
 void Protect_OverspeedCheck(void)
 {
-    if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_THRESHOLD) {
+    static uint16_t os_cnt = 0;   // 连续超阈拍数（未超阈即清零）
+
+    os_cnt = (fabsf(KTH7823_Speed_Rads) > OVERSPEED_THRESHOLD) ? (os_cnt + 1) : 0;
+
+    if (os_cnt >= OVERSPEED_CONFIRM_TICKS) {
+        os_cnt = 0;
         fault_code = FAULT_CODE_OVERSPEED;   // 锁存超速故障码
         DRV8353_Disable();
         Protect_StopPWM();
@@ -288,7 +295,6 @@ void Protect_I2tCheck(void)
 // 保护巡检
 void Protect_FOC(void)
 {
-	// 软堵转/过流保护：三相合成电流超阈值则关驱动、停 PWM，并置 fault 标志
 	Protect_StallCheck();
 	// 编码器读数有效性/断线监测：连续无效读数(0x0000/0xFFFF)则触发保护
 	Protect_EncoderStallCheck();

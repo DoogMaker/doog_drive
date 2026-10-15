@@ -24,7 +24,7 @@
 // ---------- 上位机命令 ID (命令帧数据区 byte0，上位机发送 -> 下位机接收) ----------
 #define CMD_SET_SPEED      0x01   // 设置目标速度 (int16, 单位 rad/s * 10)
 #define CMD_SET_VOLTAGE    0x02   // 设置开环电压 (int16, 单位 V * 100)
-#define CMD_SET_MODE       0x03   // 设置控制模式 (0:IDLE 1:开环 2:闭环速度 3:对齐 4:闭环位置 5:闭环力矩)
+#define CMD_SET_MODE       0x03   // 设置控制模式 (0:IDLE 1:开环 2:对齐 3:闭环力矩 4:闭环速度 5:闭环位置)
 #define CMD_SET_DIRECTION  0x04   // 设置方向 (0:正转, 1:反转)
 #define CMD_SET_TORQUE     0x05   // 设置目标转矩 (int16, 单位 Nm * 100)
 #define CMD_SET_POSITION   0x06   // 设置目标位置 (int32, 单位 rad * 10000)

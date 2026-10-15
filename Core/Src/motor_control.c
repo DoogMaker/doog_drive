@@ -6,9 +6,24 @@
 #include "tim.h"
 #include "adc.h"
 #include "stm32g4xx_hal_rcc.h"
+#include "iwdg.h"        // HAL_IWDG_Refresh / hiwdg（启动序列阻塞期间喂狗）
+#include "dwt_delay.h"   // DWT_DelayMs（自检重试间隔）
+#include "uart_cmd.h"    // UART_SendString / UART_ReportAlignResult / UART_PrintSystemReport 等
+#include <stdio.h>       // sprintf（启动序列自检报告格式化）
 
 //电机参数
 //线电阻为145mΩ±10%，线电感为59.7uH±15%，接法为星型，电机额定转速1812，额定电压24V
+
+#define AUTO_ALIGN_ON_BOOT     1      // 1 = 上电自动执行一次转子对齐；0 = 跳过（整机装配/带载场景可关闭）
+#define BOOT_ALIGN_TIMEOUT_MS  3000   // 自动对齐等待超时(ms)，超时则放弃并进入 IDLE
+#define BOOT_SC_ATTEMPT_MAX    3      // 参数自检总尝试次数（计入第一次，共 3 次）
+#define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
+#define BOOT_DEV_ERR_BLINK_MS  200    // 硬件错误(锁死)时 LED 闪烁半周期(ms)
+
+extern float manual_voltage;   // 手动给定电压 (V)（定义于 main.c）
+extern float manual_speed;     // 手动给定速度 (rad/s)（定义于 main.c）
+
+static uint8_t boot_hw_error = 0;   // 1 = 上电自检三次仍不通过，硬件错误（锁死控制命令，需检修）
 
 volatile uint32_t control_tick = 0;
 float control_dt = 0.01f;  // 控制周期 (秒)，由 MotorControl_Init 按 TIM1 频率计算
@@ -19,15 +34,10 @@ extern volatile float KTH7823_Speed_Rads;
 //电机控制初始化
 void MotorControl_Init(void)
 {
-    //计算实际控制周期
+    // 计算实际控制周期
     // TIM1 为中心对齐模式，计数时钟 = tim_clk：
-    //   PWM 频率     f_pwm = tim_clk / (2*(ARR+1))
-    //   更新中断频率 f_isr = f_pwm * 2/(RCR+1) = tim_clk / ((ARR+1)*(RCR+1))
-    //     RCR=0：上溢、下溢各触发一次 -> f_isr = 2*f_pwm（当前配置：10kHz PWM -> 20kHz 中断，
-    //            即"双采样 + 每半周期更新占空比"）
-    //     RCR=1：每个 PWM 周期只触发一次 -> f_isr = f_pwm
-    // 注意：这里必须用"更新中断频率"，不是 PWM 频率；用错会让 control_dt 差 2/(RCR+1) 倍，
-    //       进而导致 PID 等效增益、开环电角度推进速度、I²t 累积速率全部成比例偏离。
+    // PWM 频率     f_pwm = tim_clk / (2*(ARR+1))
+    // 更新中断频率 f_isr = f_pwm * 2/(RCR+1) = tim_clk / ((ARR+1)*(RCR+1))
 		uint32_t pclk2 = HAL_RCC_GetPCLK2Freq();
 		uint32_t hclk  = HAL_RCC_GetHCLKFreq();
 		uint32_t tim_clk = (pclk2 == hclk) ? pclk2 : pclk2 * 2;  // TIM1 时钟：APB2 预分频≠1 时倍频
@@ -46,7 +56,7 @@ void MotorControl_Init(void)
     //FOC 算法初始化
     FOC_Init();
 
-    // 位置环软限位/位置跟随误差阈值初始化（默认值见 Protect.c，后续可在 main 启动时根据机构行程覆盖）
+    // 位置环软限位/位置跟随误差阈值初始化
     FOC_SetSoftLimits(-3.14159f, 3.14159f);   // ±180°（输出端），按机械行程调整
     FOC_SetPositionErrorLimit(0.05f);          // 0.05 rad ≈ 2.9°，按需调整
 
@@ -62,11 +72,6 @@ void MotorControl_Init(void)
 		HAL_TIM_Base_Start_IT(&htim1); 
 
     // 启动 TIM3 更新中断（编码器刷新，10kHz，与电流采样同相位）
-    // 注意：TIM3 配置为 Trigger Mode + ITR0(=TIM1_TRGO=更新事件)，
-    //       HAL 在此模式下不置 CEN，TIM3 由 TIM1 的第一个更新沿启动。
-    //       Trigger Mode 只控制"启动"、不复位计数器（见 AN4013），故 TIM3 启动后
-    //       即用内部 72MHz 自由运行，TIM1 后续是否仍计数都不影响编码器刷新。
-    //       本调用只使能更新中断(DIER.UIE)，不手动启动计数。
     HAL_TIM_Base_Start_IT(&htim3);
 		
     //ADC自校准
@@ -92,10 +97,7 @@ void MotorControl_Init(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM1) {
-    // 角度/速度 SPI 读取已移入 TIM3 中断，本中断只消费缓存，避免阻塞 20kHz 控制节拍
-    // 注：foc.angle / foc.speed 由 FOC_Update 内部各模式分支统一赋值，此处不再冗余写入
 
-    // 更新采样
     CurrentSense_Update();	
 
     // 执行 FOC 算法（电流偏移校准完成前不执行，避免初始化期误触发保护）
@@ -103,13 +105,169 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         FOC_Update();
     }
 
-    // 控制节拍计数
     control_tick++;
   }
   else if (htim->Instance == TIM3) {
-    // 编码器刷新（10kHz，与 TIM1 更新事件同相位）：读角度 + 更新速度
-    // TIM3 抢占优先级(2)低于 TIM1(1)，可被 20kHz 控制中断抢占
+		
     KTH7823_UpdateISR();
   }
+}
+
+
+// 上电自动执行启动序列
+// 重新参数设置 + 驱动自检：使能 + 重写全部配置 + 清故障 + 重启 PWM，再读回比对
+static uint16_t Boot_ParamSetAndSelfCheck(void)
+{
+    DRV8353_Recover();            // 重新设置参数
+    return DRV8353_SelfCheck();   // 自检（读回比对 + STATUS 检查）
+}
+
+// 打印自检读回明细（与期望设置值对照）
+static void Boot_PrintSelfCheck(uint16_t sc)
+{
+    static char line[256];   // 静态区：主栈仅 1KB，避免占用（仅启动序列调用，不可重入）
+    sprintf(line,
+            "[BOOT] DRV8353 self-check: %s\r\n"
+            "       readback CTRL=0x%03X(exp 0x%03X) HS=0x%03X(exp 0x%03X) LS=0x%03X(exp 0x%03X)\r\n"
+            "                OCP=0x%03X(exp 0x%03X) CSA=0x%03X(exp 0x%03X)\r\n"
+            "                STATUS1=0x%03X STATUS2=0x%03X\r\n",
+            (sc == DRV8353_SC_OK) ? "PASS" : "FAIL",
+            drv8353_selfcheck.driver_ctrl, (DRV8353_PWM_MODE_3X | DRV8353_OCP_ACT_ALL),
+            drv8353_selfcheck.gate_hs,     DRV8353_DRIVE_STRENGTH_HS,
+            drv8353_selfcheck.gate_ls,     DRV8353_DRIVE_STRENGTH_LS,
+            drv8353_selfcheck.ocp_ctrl,    DRV8353_OCP_CONFIG,
+            drv8353_selfcheck.csa_ctrl,    DRV8353_CSA_DISABLE,
+            drv8353_selfcheck.status1,     drv8353_selfcheck.status2);
+    UART_SendString(line);
+
+    if (sc & 0x001F)                    UART_SendString("[BOOT]   config readback mismatch\r\n");
+    if (sc & DRV8353_SC_STATUS1_FAULT)  UART_SendString("[BOOT]   STATUS1 reports fault bits\r\n");
+    if (sc & DRV8353_SC_STATUS2_FAULT)  UART_SendString("[BOOT]   STATUS2 reports fault bits\r\n");
+}
+
+// 自动对齐 + 收尾进入 IDLE；返回 1=对齐成功 0=未成功（失败仅按 WARN 上报，由调用方收尾）
+static int Boot_RunAlign(void)
+{
+    int ok = 1;
+#if (AUTO_ALIGN_ON_BOOT)
+    UART_SendString("[BOOT] Auto-align start (two-step, ~1.6s)...\r\n");
+    FOC_SetMode(FOC_STATE_ALIGN);        // 触发对齐（内部会重置对齐步骤与窗口累积）
+
+    {
+        uint32_t t0 = HAL_GetTick();
+        while (foc.mode == FOC_STATE_ALIGN) {
+            /* 对齐角度源由 TIM3 中断(10kHz)独立刷新，此处无需手动读取 SPI */
+            UART_ReportAlignResult();    // 完成后格式化上报（含 delta 过小/过大 WARN）
+            UART_Tx_Poll();
+            HAL_IWDG_Refresh(&hiwdg);    // 阻塞期间喂狗，防 IWDG(约1s) 复位
+
+            if ((HAL_GetTick() - t0) > BOOT_ALIGN_TIMEOUT_MS) {
+                UART_SendString("[BOOT] WARN: auto-align TIMEOUT, abort\r\n");
+                ok = 0;
+                break;
+            }
+            DWT_DelayMs(1);
+        }
+        UART_ReportAlignResult();        // 兜底：确保最后一步结果被上报
+    }
+#else
+    UART_SendString("[BOOT] Auto-align disabled (AUTO_ALIGN_ON_BOOT=0)\r\n");
+#endif
+
+    /* 收尾：停止输出、清零给定，进入 IDLE */
+    manual_voltage    = 0.0f;
+    manual_speed      = 0.0f;
+    foc.target_speed  = 0.0f;
+    foc.target_torque = 0.0f;
+    FOC_SetMode(FOC_STATE_IDLE);
+    LED_Update();                        // 立即刷新 LED 到 IDLE 指示（熄灭）
+    return ok;
+}
+
+// 控制命令门控（uart_cmd.c / fdcan_app.c 调用）：1=放行 0=拒绝
+uint8_t MotorControl_CommandGate(void)
+{
+    if (boot_hw_error) {
+        UART_SendString("[DEVICE] ERROR: HARDWARE ERROR - control disabled. Maintenance required.\r\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* 硬件错误 LED 指示（主循环调用）：boot_hw_error=1 时闪烁提示需检修，
+ * 需在 LED_Update() 之后调用以覆盖其 IDLE 熄灭指示 */
+void MotorControl_BootErrorLed(void)
+{
+    static uint32_t tick = 0;
+    if (!boot_hw_error) return;
+    if ((HAL_GetTick() - tick) >= BOOT_DEV_ERR_BLINK_MS) {
+        tick = HAL_GetTick();
+        Run_Toggle();
+    }
+}
+
+// 上电自动执行启动序列
+void MotorControl_BootSequence(void)
+{
+    UART_SendString("\r\n\r\n===== BOOT SEQUENCE START =====\r\n");
+
+    // 参数自检：第 1 次直接检；不通过则重新参数设置 + 自检，最多共 3 次
+    uint16_t sc = DRV8353_SC_OK;
+    uint8_t  attempt;
+    for (attempt = 1u; attempt <= BOOT_SC_ATTEMPT_MAX; attempt++) {
+        if (attempt == 1u) {
+            sc = DRV8353_SelfCheck();              // MotorControl_Init 已完成参数设置
+        } else {
+            UART_SendString("[BOOT] self-check failed -> retry param-set + self-check...\r\n");
+            sc = Boot_ParamSetAndSelfCheck();      // 重新设置参数 + 自检
+        }
+        Boot_PrintSelfCheck(sc);
+
+        if (sc == DRV8353_SC_OK) {
+            UART_SendString("[BOOT] self-check PASS.\r\n");
+            break;
+        }
+
+        {
+            char line[96];
+            sprintf(line, "[BOOT] self-check FAILED (attempt %u/%u), code=0x%03X\r\n",
+                    (unsigned)attempt, (unsigned)BOOT_SC_ATTEMPT_MAX, sc);
+            UART_SendString(line);
+        }
+
+        HAL_IWDG_Refresh(&hiwdg);                  // 重试期间喂狗，防 IWDG(约1s) 复位
+        if (attempt < BOOT_SC_ATTEMPT_MAX) DWT_DelayMs(BOOT_SC_RETRY_DELAY_MS);
+    }
+
+    // 参数校验打印（信息展示，不参与判定）
+    UART_PrintSystemReport();
+
+    // 三次仍不通过：硬件错误，跳过对齐，进 IDLE 并锁死控制命令
+    if (sc != DRV8353_SC_OK) {
+        boot_hw_error = 1;
+
+        manual_voltage    = 0.0f;
+        manual_speed      = 0.0f;
+        foc.target_speed  = 0.0f;
+        foc.target_torque = 0.0f;
+        FOC_SetMode(FOC_STATE_IDLE);
+        LED_Update();
+
+        UART_SendString("[BOOT] ERROR: HARDWARE ERROR - driver self-check failed 3 times. "
+                        "Align skipped, entered IDLE. Maintenance required.\r\n");
+        UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
+        return;
+    }
+
+    // 自检通过：自动对齐（失败仅 WARN，仍进入 IDLE 等待控制）
+    if (Boot_RunAlign()) {
+        UART_SendString("[BOOT] Boot self-check complete. Entered IDLE, waiting for control.\r\n");
+    } else {
+        UART_SendString("[BOOT] WARN: self-check PASS but align not successful. "
+                        "Entered IDLE, waiting for control.\r\n");
+    }
+    UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
+		
+    UART_SendString("Please send “help” for more information.\r\n\r\n");		
 }
 

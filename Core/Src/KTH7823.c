@@ -18,6 +18,9 @@ volatile uint32_t encoder_update_count = 0;
 // 连续异常读数（0x0000/0xFFFF）计数：正常读数清零，供 Protect_EncoderStallCheck 判定读数有效性
 volatile uint16_t kth7823_raw_fault_cnt = 0;
 
+// 被丢弃的解包裹野值累计次数（诊断用，只增不清零；正常应保持 0 或偶发）
+volatile uint16_t kth7823_unwrap_glitch_cnt = 0;
+
 // 滤波变量
 static float filtered_cos = 1.0f;
 static float filtered_sin = 0.0f;
@@ -31,6 +34,7 @@ static uint32_t last_speed_tick = 0;     // 上次 UpdateSpeed 的 DWT->CYCCNT �
 // SPI 收发一帧 16bit（uint16_t 单帧 + Size=1，避免 16 位模式下字节序/越界问题）
 static uint16_t spi_exchange_frame(uint16_t tx)
 {
+    // 初始化为0
     uint16_t txw = tx;   // 直接 16 位，硬件 MSB 先发，无字节序问题
     uint16_t rxw = 0;
 
@@ -57,7 +61,6 @@ static float raw_to_rad(uint16_t raw)
 // KTH7823 初始化
 void KTH7823_Init(void)
 {
-    // 初始化为0
     KTH7823_Angle_Rad = 0.0f;
     KTH7823_Angle_Deg = 0.0f;
     KTH7823_Angle_Multiturn = 0.0f;
@@ -72,6 +75,7 @@ void KTH7823_Init(void)
     last_unwrapped_angle = 0.0f;  // 复位速度差分基准，避免重新 Init 后首帧速度跳变
     last_speed_tick = 0;          // 复位速度计时基准，首帧 UpdateSpeed 不计算速度
     kth7823_raw_fault_cnt = 0;    // 复位异常读数计数
+    kth7823_unwrap_glitch_cnt = 0; // 复位野值剔除计数
     encoder_update_count = 0;
 
     //  丢弃首次无效值 + 建立通信 
@@ -79,11 +83,11 @@ void KTH7823_Init(void)
     DWT_DelayMs(10);
 }
 
-// 更新当前角度（应在主循环 ~1kHz 调用）
+// 更新当前角度
 void KTH7823_UpdateAngle(void)
 {
     uint16_t raw = KTH7823_ReadAngleRaw();
-	float raw_rad = raw_to_rad(raw);
+		float raw_rad = raw_to_rad(raw);
 
     // 异常读数统计：0x0000/0xFFFF 视为断线/无磁等无效读数，连续累加；正常读数清零
     if (raw == 0x0000u || raw == 0xFFFFu) {
@@ -99,8 +103,15 @@ void KTH7823_UpdateAngle(void)
         raw_initialized = 1;
     } else {
         int16_t delta_raw = (int16_t)(raw - last_raw_angle);  // 自动处理跨 0xFFFF 边界
-        last_raw_angle = raw;
-        angle_unwrapped += (float)delta_raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;
+        // 野值剔除：单次刷新内跳变超物理可能上限（见 KTH7823_UNWRAP_MAX_DELTA），判为坏读数/
+        // 解包裹野值，丢弃本次——不更新 last_raw_angle、不累积角度，等下一次好读数再接续，
+        // 从而避免多圈角度阶跃与测速尖峰（后者会误触发超速保护）。
+        if (delta_raw > KTH7823_UNWRAP_MAX_DELTA || delta_raw < -KTH7823_UNWRAP_MAX_DELTA) {
+            if (kth7823_unwrap_glitch_cnt < 0xFFFFu) kth7823_unwrap_glitch_cnt++;
+        } else {
+            last_raw_angle = raw;
+            angle_unwrapped += (float)delta_raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;
+        }
     }
 
     // sin/cos 一阶低通滤波

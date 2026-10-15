@@ -13,6 +13,9 @@
 // 连续异常读数（0x0000 / 0xFFFF）次数阈值：达到即判编码器读数失效（断线/无磁）
 #define KTH7823_RAW_FAULT_LIMIT   8u
 
+// 多圈解包裹"野值剔除"上限
+#define KTH7823_UNWRAP_MAX_DELTA   1024
+
 void KTH7823_Init(void);    
 uint16_t KTH7823_ReadAngleRaw(void);    
 void KTH7823_UpdateAngle(void);
@@ -29,5 +32,8 @@ extern volatile uint32_t encoder_update_count;
 
 // 连续读到异常原始值（0x0000/0xFFFF）的次数，供 Protect 判定读数有效性；正常读数清零
 extern volatile uint16_t kth7823_raw_fault_cnt;
+
+// 被丢弃的解包裹野值累计次数（诊断用，只增不清零）
+extern volatile uint16_t kth7823_unwrap_glitch_cnt;
 
 #endif

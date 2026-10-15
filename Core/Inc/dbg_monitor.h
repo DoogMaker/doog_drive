@@ -15,8 +15,7 @@
  * ===================================================================== */
 typedef struct {
     /* ---- 运行状态 ---- */
-    uint8_t  mode;              // FOC 状态机：0=IDLE 1=ALIGN 2=OPENLOOP 3=CLOSEDLOOP 4=FAULT
-    uint8_t  closedloop_mode;   // 闭环级联深度：0=力矩 1=速度 2=位置
+    uint8_t  mode;              // FOC 状态机：0=IDLE 1=OPENLOOP 2=ALIGN 3=TORQUE 4=SPEED 5=POSITION 6=FAULT
     uint8_t  fault_code;        // 当前故障码 (FAULT_CODE_*，上报后清零)
     uint8_t  last_fault_code;   // 最近一次故障码（锁存，不清零，便于事后定位）
     uint8_t  fault_triggered;   // 故障触发标志

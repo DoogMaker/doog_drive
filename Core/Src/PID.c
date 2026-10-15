@@ -1,6 +1,7 @@
 #include "pid.h"
 #include <math.h>
 
+    // 计算误差
 /**
  * @brief 初始化PID控制器
  * @param pid    句柄指针
@@ -34,7 +35,6 @@ float PID_Calculate(PID_Handle_t *pid, float target, float feedback, float dt)
     // dt 合法性保护：防止除零/NaN 雪崩（上游 control_dt 异常时）
     if (dt <= 1e-6f) dt = 1e-6f;
 
-    // 计算误差
     float error = target - feedback;
 
     // 比例项 (P)

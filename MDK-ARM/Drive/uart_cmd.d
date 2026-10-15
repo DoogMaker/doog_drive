@@ -34,4 +34,5 @@ drive/uart_cmd.o: ..\Core\Src\uart_cmd.c ..\Core\Inc\uart_cmd.h \
   ..\Core\Inc\usart.h ..\Core\Inc\DRV8353.h ..\Core\Inc\foc.h \
   ..\Core\Inc\pid.h ..\Core\Inc\sense.h ..\Core\Inc\kth7823.h \
   ..\Core\Inc\Protect.h ..\Core\Inc\fdcan_app.h ..\Core\Inc\fdcan.h \
-  ..\Core\Inc\dwt_delay.h ..\Core\Inc\iwdg.h
+  ..\Core\Inc\dwt_delay.h ..\Core\Inc\iwdg.h ..\Core\Inc\motor_control.h \
+  ..\Core\Inc\spi.h ..\Core\Inc\encoder2.h

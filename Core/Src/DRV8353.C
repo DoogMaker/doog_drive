@@ -27,7 +27,7 @@ void DRV8353_WriteReg(uint8_t reg, uint16_t data)
     uint16_t rx = 0;
 
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_RESET);
-	DWT_DelayMs(1);
+		DWT_DelayMs(1);
     HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
 }
@@ -72,19 +72,19 @@ void DRV8353_Init(void)
 {	
     DRV8353_Enable();
 
-	// 等待芯片上电稳定
-	DWT_DelayMs(100);
+		// 等待芯片上电稳定
+		DWT_DelayMs(100);
 
-	DRV8353_ConfigRegs();
+		DRV8353_ConfigRegs();
 
-	// 读取状态寄存器确认配置成功
-	status = DRV8353_ReadReg(DRV8353_REG_STATUS1);
+		// 读取状态寄存器确认配置成功
+		status = DRV8353_ReadReg(DRV8353_REG_STATUS1);
 	
     // 检查 FAULT 位 (STATUS1 bit10 = 0x0400)
     if (status & 0x0400) {
-        // 清除故障（写 CLR_FLT 位）
+    // 清除故障（写 CLR_FLT 位）
 		DRV8353_ClearFault();
-     }
+    }
 }
 
 // 清除故障
@@ -104,9 +104,6 @@ void DRV8353_ClearFault(void)
   */
 void DRV8353_Recover(void)
 {
-    // 故障恢复时必须重新写入所有配置寄存器：
-    // EN 被拉低(睡眠)后 DRV8353F 的 DRIVER_CTRL/GATE_DRIVE/OCP/CSA 全部恢复默认，
-    // 若不重写，恢复后将以默认配置(6x PWM、非锁存 OCP、内部 CSA 使能)吃 PWM，可能直通炸管。
     DRV8353_Enable();                   // PA11 拉高，退出睡眠(EN=1)
     DWT_DelayMs(2);                     // tREADY：EN 拉高到 SPI 就绪(数据手册典型 1ms)
     DRV8353_ConfigRegs();               // 重新写入完整运行配置，覆盖睡眠清掉的默认值
@@ -121,7 +118,7 @@ void DRV8353_Recover(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 }
 
-// 最近一次自检读回快照（定义于此处，声明见 DRV8353.H）
+// 最近一次自检读回快照
 DRV8353_SelfCheck_Report_t drv8353_selfcheck;
 
 /**

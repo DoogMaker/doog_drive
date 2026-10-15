@@ -61,9 +61,9 @@ extern FDCAN_HandleTypeDef hfdcan2;
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim3;
 extern DMA_HandleTypeDef hdma_usart3_tx;
+extern DMA_HandleTypeDef hdma_usart3_rx;
 extern UART_HandleTypeDef huart3;
 /* USER CODE BEGIN EV */
-extern DMA_HandleTypeDef hdma_usart3_rx;   // USART3 RX DMA（定义于 usart.c）
 
 /* USER CODE END EV */
 
@@ -248,6 +248,20 @@ void DMA1_Channel3_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles DMA1 channel4 global interrupt.
+  */
+void DMA1_Channel4_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Channel4_IRQn 0 */
+
+  /* USER CODE END DMA1_Channel4_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_usart3_rx);
+  /* USER CODE BEGIN DMA1_Channel4_IRQn 1 */
+
+  /* USER CODE END DMA1_Channel4_IRQn 1 */
+}
+
+/**
   * @brief This function handles TIM1 update interrupt and TIM16 global interrupt.
   */
 void TIM1_UP_TIM16_IRQHandler(void)
@@ -332,15 +346,5 @@ void FDCAN2_IT1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-
-/**
-  * @brief This function handles DMA1 channel4 global interrupt.
-  * @note  USART3 RX DMA（循环模式）：半满/全满事件在这里转到 HAL_UARTEx_RxEventCallback。
-  *        放在 USER CODE 段，CubeMX 重新生成不会删除。
-  */
-void DMA1_Channel4_IRQHandler(void)
-{
-  HAL_DMA_IRQHandler(&hdma_usart3_rx);
-}
 
 /* USER CODE END 1 */

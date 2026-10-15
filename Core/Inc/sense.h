@@ -10,8 +10,8 @@
 #define ADC_MAX_VALUE        4095.0f   // 12位 ADC 最大量化值 (0~4095)，电流/母线/NTC 统一使用
 #define INA240_VREF          (ADC_REF_VOLTAGE / 2.0f)  // 1.65V
 
-// 母线电压分压比
-#define VOLTAGE_DIVIDER_RATIO  14.5f
+// 母线电压分压比：R_top=100k，R_bot=7.5k（中点并 100nF，再经 100k 限流进 ADC）
+#define VOLTAGE_DIVIDER_RATIO  ((100.0f + 7.5f) / 7.5f)
 
 // MOSFET NTC参数 
 #define MOS_B       3450.0f    // B值, 单位: K
