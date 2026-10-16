@@ -154,6 +154,24 @@ extern volatile float   align_report_delta;      // 本次测得的角度变化 
 extern volatile int8_t  align_report_direction;  // 本次得到的方向 (+1/-1)
 extern volatile uint32_t align_report_samples;   // 本次窗口平均用到的样点数（诊断用）
 
+// 对齐步进可见（诊断）：控制中断（20kHz）是生产者，主循环 UART_ReportAlignStep() 是消费者，
+// 中断侧只写标量/小结构，不做 sprintf/串口。
+// 必须是队列而不是单个标量：step0 结束与 step90 开始只相隔 1 拍（50µs），
+// 单槽会被紧接着的下一事件覆盖，主循环（约 1kHz）几乎必然丢掉"step0 end"这一行。
+#define ALIGN_STEP_EVT_DEPTH 8u   // 步进事件环形缓冲深度（必须是 2 的幂；一次对齐只产生 4 条）
+typedef struct {
+    uint8_t  evt;      // 1=step0 启动 2=step0 结束 3=step90 启动 4=step90 结束
+    uint32_t ms;       // 事件发生时刻 (HAL_GetTick, ms)
+    uint32_t nsamp;    // 本步窗口平均样点数（仅"结束"事件有意义，其余为 0）
+} AlignStepEvt_t;
+
+extern volatile uint8_t  foc_align_step_pub;   // 当前对齐步（1 基：1=step0 2=step90 3=done；0=未进入过对齐）
+                                               // 离开 ALIGN 后保持最后一步的值，需结合 [FLT] 的 mode 一起判读
+extern volatile AlignStepEvt_t align_step_evt_q[ALIGN_STEP_EVT_DEPTH];  // 步进事件环形缓冲
+extern volatile uint8_t  align_step_evt_head;  // 写指针（生产者：20kHz 中断）
+extern volatile uint8_t  align_step_evt_tail;  // 读指针（消费者：主循环）
+extern volatile uint32_t align_step_evt_lost;  // 缓冲满而丢弃的事件数（正常恒为 0）
+
 // PID 控制器句柄（定义于 FOC.c，供 UART 在线调参等外部模块访问）
 extern PID_Handle_t pid_speed;     // 速度环 PID
 extern PID_Handle_t pid_id;        // d 轴电流环 PID
@@ -173,6 +191,7 @@ extern float pos_error_limit;
 void FOC_Init(void);
 void FOC_Update(void);
 void FOC_FaultRecoverProcess(void);   // 故障恢复执行体（主循环调用）：仅此地执行阻塞式 DRV8353_Recover()
+uint8_t FOC_AlignStepEvtPop(AlignStepEvt_t *out);  // 取出一条对齐步进事件：1=取到 0=空（主循环消费）
 void LED_Update(void);   // LED 状态指示（运行常亮，待机熄灭，故障闪烁，主循环调用）
 
 void FOC_Clark(void);

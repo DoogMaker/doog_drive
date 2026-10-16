@@ -38,6 +38,9 @@ void UART_Tx_Poll(void);
 // 主循环调用：对齐完成结果上报（对齐逻辑在中断里置标志，本函数负责格式化+发送）
 void UART_ReportAlignResult(void);
 
+// 主循环/启动序列调用：对齐步进上报（[ALIGN] stepN start/end，带 ms 时间戳）
+void UART_ReportAlignStep(void);
+
 // 上电参数校验打印（启动序列调用）：逐项输出 PID/限位/阈值/母线电压/温度/关键常量及 PASS/WARN
 void UART_PrintSystemReport(void);
 

@@ -8,7 +8,8 @@
 #include "stm32g4xx_hal_rcc.h"
 #include "iwdg.h"        // HAL_IWDG_Refresh / hiwdg（启动序列阻塞期间喂狗）
 #include "dwt_delay.h"   // DWT_DelayMs（自检重试间隔）
-#include "uart_cmd.h"    // UART_SendString / UART_ReportAlignResult / UART_PrintSystemReport 等
+#include "uart_cmd.h"    // UART_SendString / UART_ReportAlignResult / UART_ReportAlignStep / UART_PrintSystemReport 等
+#include "fdcan_app.h"   // FDCAN_App_Process（对齐阻塞等待期间仍需服务 CAN，否则上位机看到"无响应"）
 #include <stdio.h>       // sprintf（启动序列自检报告格式化）
 
 //电机参数
@@ -149,6 +150,7 @@ static void Boot_PrintSelfCheck(uint16_t sc)
 static int Boot_RunAlign(void)
 {
     int ok = 1;
+    uint8_t host_took_over = 0;
 #if (AUTO_ALIGN_ON_BOOT)
     UART_SendString("[BOOT] Auto-align start (two-step, ~1.6s)...\r\n");
     FOC_SetMode(FOC_STATE_ALIGN);        // 触发对齐（内部会重置对齐步骤与窗口累积）
@@ -157,7 +159,12 @@ static int Boot_RunAlign(void)
         uint32_t t0 = HAL_GetTick();
         while (foc.mode == FOC_STATE_ALIGN) {
             /* 对齐角度源由 TIM3 中断(10kHz)独立刷新，此处无需手动读取 SPI */
+            /* 本循环是阻塞等待（最长 BOOT_ALIGN_TIMEOUT_MS），必须照常服务 CAN：
+             * 否则对齐期间上位机的 0x08/0x09/0x10 全部无响应，上位机侧看起来就是"驱动器失联"。
+             * 外设与接收队列在 main() 里已由 FDCAN_App_Init() 就绪，可安全调用（非阻塞）。 */
+            FDCAN_App_Process();
             UART_ReportAlignResult();    // 完成后格式化上报（含 delta 过小/过大 WARN）
+            UART_ReportAlignStep();      // 对齐步进事件（step0/step90 start/end，带 ms 时间戳）
             UART_Tx_Poll();
             HAL_IWDG_Refresh(&hiwdg);    // 阻塞期间喂狗，防 IWDG(约1s) 复位
 
@@ -169,18 +176,30 @@ static int Boot_RunAlign(void)
             DWT_DelayMs(1);
         }
         UART_ReportAlignResult();        // 兜底：确保最后一步结果被上报
+
+        /* 本次对齐自主结束（ALIGN_STEP_DONE 在中断里切到 OPENLOOP）或超时（仍是 ALIGN）之外，
+         * 说明上位机在对齐期间下了 0x03 切到了别的模式：那已是上位机在接管，收尾不得覆盖。 */
+        host_took_over = (foc.mode != FOC_STATE_OPENLOOP && foc.mode != FOC_STATE_ALIGN) ? 1u : 0u;
     }
 #else
     UART_SendString("[BOOT] Auto-align disabled (AUTO_ALIGN_ON_BOOT=0)\r\n");
 #endif
 
-    /* 收尾：停止输出、清零给定，进入 IDLE */
-    manual_voltage    = 0.0f;
-    manual_speed      = 0.0f;
-    foc.target_speed  = 0.0f;
-    foc.target_torque = 0.0f;
-    FOC_SetMode(FOC_STATE_IDLE);
-    LED_Update();                        // 立即刷新 LED 到 IDLE 指示（熄灭）
+    if (!host_took_over) {
+        /* 收尾：停止输出、清零给定，进入 IDLE */
+        manual_voltage    = 0.0f;
+        manual_speed      = 0.0f;
+        foc.target_speed  = 0.0f;
+        foc.target_torque = 0.0f;
+        FOC_SetMode(FOC_STATE_IDLE);
+        LED_Update();                    // 立即刷新 LED 到 IDLE 指示（熄灭）
+    } else {
+        /* 上位机已接管：模式与给定保持上位机所设，只提示一句，不碰 foc.mode/给定 */
+        char line[64];
+        sprintf(line, "[BOOT] host took over during align (mode=%u), boot finishing skipped\r\n",
+                (unsigned)foc.mode);
+        UART_SendString(line);
+    }
     return ok;
 }
 

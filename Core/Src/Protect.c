@@ -147,6 +147,13 @@ uint8_t Protect_CommIsArmed(void)
     return comm_armed;
 }
 
+// 当前通讯静默拍数（连续未收到上位机帧的控制周期数，20kHz 下 ×50µs = ms）。
+// 供失联现场记录（[FLT]）与串口 can 诊断读取；不改变任何状态。
+uint32_t Protect_CommSilentTicks(void)
+{
+    return comm_silent_ticks;
+}
+
 // MOSSFET/线圈过温保护
 // 温度超过关断阈值即停驱动并交状态机退避；
 // 恢复条件在 FOC_Update 的 FOC_STATE_FAULT 分支内：温度未降到恢复阈值则继续冷却（滞回）

@@ -241,6 +241,7 @@ int main(void)
 //		UART_SendStatus();
 
 		UART_ReportAlignResult();
+		UART_ReportAlignStep();   // 对齐步进事件（[ALIGN] stepN start/end）
 
 		// 非阻塞发送兜底：发送链路异常（HAL 启动失败/出错）时恢复，正常无开销
 		UART_Tx_Poll();

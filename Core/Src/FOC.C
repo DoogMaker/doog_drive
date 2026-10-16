@@ -39,6 +39,39 @@ volatile float   align_report_delta     = 0.0f; // 本次测得的角度变化 (
 volatile int8_t  align_report_direction = 1;    // 本次得到的方向 (+1/-1)
 volatile uint32_t align_report_samples  = 0;    // 本次窗口平均用到的样点数（诊断用）
 
+// 对齐步进可见（诊断）：控制中断（20kHz）只写标量/小结构（同 align_report_* 的约定，
+// 不在中断里做 sprintf/串口），格式化上报由主循环的 UART_ReportAlignStep() 完成。
+volatile uint8_t  foc_align_step_pub = 0;    // 当前对齐步 1 基编码（1=step0 2=step90 3=done，0=未对齐过），供 [FLT] 现场记录
+volatile AlignStepEvt_t align_step_evt_q[ALIGN_STEP_EVT_DEPTH];  // 步进事件环形缓冲
+volatile uint8_t  align_step_evt_head = 0;   // 写指针（生产者：20kHz 中断）
+volatile uint8_t  align_step_evt_tail = 0;   // 读指针（消费者：主循环）
+volatile uint32_t align_step_evt_lost = 0;   // 缓冲满而丢弃的事件数
+
+// 步进事件入队（控制中断内调用）：只写标量 + 拷贝小结构，非阻塞。
+// 用队列而非单槽的原因见 FOC.H：step0 结束与 step90 开始只相隔 1 拍（50µs）。
+static void align_step_evt_push(uint8_t evt, uint32_t ms, uint32_t nsamp)
+{
+    uint8_t next = (uint8_t)((align_step_evt_head + 1u) & (ALIGN_STEP_EVT_DEPTH - 1u));
+    if (next == align_step_evt_tail) { align_step_evt_lost++; return; }   // 满：丢最新并计数
+
+    align_step_evt_q[align_step_evt_head].evt   = evt;
+    align_step_evt_q[align_step_evt_head].ms    = ms;
+    align_step_evt_q[align_step_evt_head].nsamp = nsamp;
+    align_step_evt_head = next;                  // 数据写完最后再推进写指针
+}
+
+// 步进事件出队（主循环调用）：1=取到一条，0=队列空
+uint8_t FOC_AlignStepEvtPop(AlignStepEvt_t *out)
+{
+    if (align_step_evt_tail == align_step_evt_head) return 0;   // 队列空
+
+    out->evt   = align_step_evt_q[align_step_evt_tail].evt;
+    out->ms    = align_step_evt_q[align_step_evt_tail].ms;
+    out->nsamp = align_step_evt_q[align_step_evt_tail].nsamp;
+    align_step_evt_tail = (uint8_t)((align_step_evt_tail + 1u) & (ALIGN_STEP_EVT_DEPTH - 1u));
+    return 1;
+}
+
 static uint32_t led_blink_tick = 0;    // LED 闪烁计时基准(ms)，进入 FAULT 时重置
 extern float control_dt;       // 控制周期 (秒)，由 motor_control.c 提供
 extern volatile float bus_voltage;			//母线电压采样
@@ -605,6 +638,10 @@ void FOC_Update(void)
 		case FOC_STATE_ALIGN:// 对齐模式：将转子拉到固定位置（0° 和 90°）
 			// 每拍累积"末尾窗口"内的角度样点，供步进结束时取平均（替代单点采样）
 			align_accumulate();
+			// 供失联/故障现场记录读取（1 基编码，0 表示"未进入过对齐"）：
+			// 任何原因（保护停机/切模式）离开 ALIGN 时，这个值就是"被打断在哪一步"；
+			// 每拍刷新即可覆盖下面两次步进迁移（含对齐正常走完 → 3=done）。
+			foc_align_step_pub = (uint8_t)align_step + 1u;
 
 			switch (align_step) {
 				case ALIGN_STEP_0:
@@ -612,10 +649,16 @@ void FOC_Update(void)
 					foc.Vd = ALIGN_VOLTAGE;  
 					foc.Vq = 0.0f;
 					foc.angle = 0.0f;
-					if (align_step_time == 0) align_step_time = HAL_GetTick();
+					if (align_step_time == 0) {
+						align_step_time = HAL_GetTick();
+						// 进入本步：产生 start 事件（主循环打印 [ALIGN] ... start）
+						align_step_evt_push(1u, align_step_time, 0u);
+					}
 					if (HAL_GetTick() - align_step_time > ALIGN_STEP_DELAY) {
 						start_angle_raw = align_average_angle();   // 窗口平均，非单点
 						align_step = ALIGN_STEP_90;
+						// 离开 step0：本步结束事件（带本步窗口平均的样点数）
+						align_step_evt_push(2u, HAL_GetTick(), align_last_samples);
 						align_step_time = 0;
 						align_accum_reset();
 					}
@@ -627,10 +670,16 @@ void FOC_Update(void)
 					foc.Vd = ALIGN_VOLTAGE;
 					foc.Vq = 0.0f;
 					foc.angle = PI / 2.0f;
-					if (align_step_time == 0) align_step_time = HAL_GetTick();
+					if (align_step_time == 0) {
+						align_step_time = HAL_GetTick();
+						// 进入本步：产生 start 事件（主循环打印 [ALIGN] ... start）
+						align_step_evt_push(3u, align_step_time, 0u);
+					}
 					if (HAL_GetTick() - align_step_time > ALIGN_STEP_DELAY) {
 						end_angle_raw = align_average_angle();     // 窗口平均，非单点
 						align_step = ALIGN_STEP_DONE;
+						// 离开 step90：本步结束事件（带本步窗口平均的样点数）
+						align_step_evt_push(4u, HAL_GetTick(), align_last_samples);
 						align_step_time = 0;
 						align_accum_reset();
 					}

@@ -45,8 +45,11 @@
 // 本检测在 20kHz 控制中断内调用（1ms = 20 个控制周期），收到首帧后开始生效；
 // 连续 COMM_TIMEOUT_TICKS 个控制周期心跳无增长即判定失联，立即停机
 // （防上位机死机/线缆断开/总线故障）。
-// 阈值取 20ms ≈ 丢失 20 帧（20 倍于正常帧间隔），既灵敏又抗偶发丢帧/中断抖动。
-#define COMM_TIMEOUT_TICKS   400    // 失联判定阈值（20kHz 下 = 20ms）
+// 阈值取 100ms：上位机帧间隔必须 < 100ms（推荐 1kHz，最低 10Hz）。
+//   100ms ≈ 丢失 100 帧 @1kHz / 5 个帧间隔 @50Hz，既灵敏又抗偶发丢帧/中断抖动。
+// 注意：ALIGN 是唯一"自动持续 1.6s（ALIGN_STEP_DELAY 800ms × 2 步）、且只能靠持续发帧
+//   才不被中断"的状态，期间必须持续发帧（对齐被失联保护打断后不会自行完成）。
+#define COMM_TIMEOUT_TICKS   2000    // 失联判定阈值（20kHz 下 = 100ms）
 
 // 过温保护阈值（NTC 测线圈温度）
 // 超过关断阈值停驱动；温度回落到恢复阈值以下才允许恢复（20℃ 滞回，防震荡）。
@@ -100,6 +103,9 @@ extern volatile uint32_t comm_rx_count;
 
 // 当前失联保护是否已武装（1 = 收到过 CAN 帧、失联检测已生效），串口 can 诊断命令显示
 uint8_t Protect_CommIsArmed(void);
+
+// 当前通讯静默拍数（连续未收到上位机帧的控制周期数，20kHz 下 1 拍 = 50µs），失联现场记录读取
+uint32_t Protect_CommSilentTicks(void);
 
 // 上位机通讯连续中断超时
 void Protect_CommTimeoutCheck(void);
