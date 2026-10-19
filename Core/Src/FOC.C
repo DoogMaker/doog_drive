@@ -985,6 +985,7 @@ void DBG_Monitor_Update(void)
 	dbg.fault_retry_cnt = foc.fault_retry_cnt;
 	dbg.fault_status1   = fault_status1;
 	dbg.fault_status2   = fault_status2;
+	dbg.fault_mask      = fault_mask;
 	dbg.tick            = HAL_GetTick();
 
 	// ---- 电流 ----

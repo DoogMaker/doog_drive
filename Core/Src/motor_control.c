@@ -8,14 +8,12 @@
 #include "stm32g4xx_hal_rcc.h"
 #include "iwdg.h"        // HAL_IWDG_Refresh / hiwdg（启动序列阻塞期间喂狗）
 #include "dwt_delay.h"   // DWT_DelayMs（自检重试间隔）
-#include "uart_cmd.h"    // UART_SendString / UART_ReportAlignResult / UART_PrintSystemReport 等
+#include "uart_cmd.h"    // UART_SendString / UART_PrintSystemReport 等
 #include <stdio.h>       // sprintf（启动序列自检报告格式化）
 
 //电机参数
 //线电阻为145mΩ±10%，线电感为59.7uH±15%，接法为星型，电机额定转速1812，额定电压24V
 
-#define AUTO_ALIGN_ON_BOOT     1      // 1 = 上电自动执行一次转子对齐；0 = 跳过（整机装配/带载场景可关闭）
-#define BOOT_ALIGN_TIMEOUT_MS  3000   // 自动对齐等待超时(ms)，超时则放弃并进入 IDLE
 #define BOOT_SC_ATTEMPT_MAX    3      // 参数自检总尝试次数（计入第一次，共 3 次）
 #define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
 #define BOOT_DEV_ERR_BLINK_MS  200    // 硬件错误(锁死)时 LED 闪烁半周期(ms)
@@ -72,7 +70,10 @@ void MotorControl_Init(void)
 		HAL_TIM_Base_Start_IT(&htim1); 
 
     // 启动 TIM3 更新中断（编码器刷新，10kHz，与电流采样同相位）
+    // [TEST] 主循环刷新模式下不启动 TIM3：编码器改由 main.c 的 while(1) 轮询（约 1kHz）
+#if !ENCODER_REFRESH_IN_MAIN_LOOP
     HAL_TIM_Base_Start_IT(&htim3);
+#endif
 		
     //ADC自校准
     HAL_ADCEx_Calibration_Start(&hadc1,ADC_DIFFERENTIAL_ENDED);
@@ -107,10 +108,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     control_tick++;
   }
+#if !ENCODER_REFRESH_IN_MAIN_LOOP
   else if (htim->Instance == TIM3) {
-		
+	
     KTH7823_UpdateISR();
   }
+#endif
 }
 
 
@@ -143,45 +146,6 @@ static void Boot_PrintSelfCheck(uint16_t sc)
     if (sc & 0x001F)                    UART_SendString("[BOOT]   config readback mismatch\r\n");
     if (sc & DRV8353_SC_STATUS1_FAULT)  UART_SendString("[BOOT]   STATUS1 reports fault bits\r\n");
     if (sc & DRV8353_SC_STATUS2_FAULT)  UART_SendString("[BOOT]   STATUS2 reports fault bits\r\n");
-}
-
-// 自动对齐 + 收尾进入 IDLE；返回 1=对齐成功 0=未成功（失败仅按 WARN 上报，由调用方收尾）
-static int Boot_RunAlign(void)
-{
-    int ok = 1;
-#if (AUTO_ALIGN_ON_BOOT)
-    UART_SendString("[BOOT] Auto-align start (two-step, ~1.6s)...\r\n");
-    FOC_SetMode(FOC_STATE_ALIGN);        // 触发对齐（内部会重置对齐步骤与窗口累积）
-
-    {
-        uint32_t t0 = HAL_GetTick();
-        while (foc.mode == FOC_STATE_ALIGN) {
-            /* 对齐角度源由 TIM3 中断(10kHz)独立刷新，此处无需手动读取 SPI */
-            UART_ReportAlignResult();    // 完成后格式化上报（含 delta 过小/过大 WARN）
-            UART_Tx_Poll();
-            HAL_IWDG_Refresh(&hiwdg);    // 阻塞期间喂狗，防 IWDG(约1s) 复位
-
-            if ((HAL_GetTick() - t0) > BOOT_ALIGN_TIMEOUT_MS) {
-                UART_SendString("[BOOT] WARN: auto-align TIMEOUT, abort\r\n");
-                ok = 0;
-                break;
-            }
-            DWT_DelayMs(1);
-        }
-        UART_ReportAlignResult();        // 兜底：确保最后一步结果被上报
-    }
-#else
-    UART_SendString("[BOOT] Auto-align disabled (AUTO_ALIGN_ON_BOOT=0)\r\n");
-#endif
-
-    /* 收尾：停止输出、清零给定，进入 IDLE */
-    manual_voltage    = 0.0f;
-    manual_speed      = 0.0f;
-    foc.target_speed  = 0.0f;
-    foc.target_torque = 0.0f;
-    FOC_SetMode(FOC_STATE_IDLE);
-    LED_Update();                        // 立即刷新 LED 到 IDLE 指示（熄灭）
-    return ok;
 }
 
 // 控制命令门控（uart_cmd.c / fdcan_app.c 调用）：1=放行 0=拒绝
@@ -242,7 +206,7 @@ void MotorControl_BootSequence(void)
     // 参数校验打印（信息展示，不参与判定）
     UART_PrintSystemReport();
 
-    // 三次仍不通过：硬件错误，跳过对齐，进 IDLE 并锁死控制命令
+    // 三次仍不通过：硬件错误，进 IDLE 并锁死控制命令
     if (sc != DRV8353_SC_OK) {
         boot_hw_error = 1;
 
@@ -254,18 +218,20 @@ void MotorControl_BootSequence(void)
         LED_Update();
 
         UART_SendString("[BOOT] ERROR: HARDWARE ERROR - driver self-check failed 3 times. "
-                        "Align skipped, entered IDLE. Maintenance required.\r\n");
+                        "Entered IDLE. Maintenance required.\r\n");
         UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
         return;
     }
 
-    // 自检通过：自动对齐（失败仅 WARN，仍进入 IDLE 等待控制）
-    if (Boot_RunAlign()) {
-        UART_SendString("[BOOT] Boot self-check complete. Entered IDLE, waiting for control.\r\n");
-    } else {
-        UART_SendString("[BOOT] WARN: self-check PASS but align not successful. "
-                        "Entered IDLE, waiting for control.\r\n");
-    }
+    // 自检通过：停止输出、清零给定，进入 IDLE 等待控制（不做上电自动对齐）
+    manual_voltage    = 0.0f;
+    manual_speed      = 0.0f;
+    foc.target_speed  = 0.0f;
+    foc.target_torque = 0.0f;
+    FOC_SetMode(FOC_STATE_IDLE);
+    LED_Update();
+
+    UART_SendString("[BOOT] Driver param check PASS. Entered IDLE, waiting for control.\r\n");
     UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
 		
     UART_SendString("Please send “help” for more information.\r\n\r\n");		

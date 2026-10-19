@@ -381,6 +381,7 @@ typedef struct {
     uint8_t  code;       /* 触发瞬间的 fault_code */
     uint8_t  mode;       /* 触发瞬间的 foc.mode（内部枚举） */
     uint8_t  retry;      /* 触发瞬间的 fault_retry_cnt */
+    uint16_t mask;       /* 触发瞬间的 fault_mask（本次事件触发过的所有保护位） */
     uint16_t st1, st2;   /* 触发瞬间锁存的 DRV8353 STATUS1/2 */
 } UartLog_FaultEvt_t;
 
@@ -435,6 +436,33 @@ static const char* UartLog_FaultName(uint8_t code)
     }
 }
 
+/* [TEST] 故障掩码 -> 名称串（"A|B|C"）；无位时输出 "-" */
+static void UartLog_MaskToStr(uint16_t mask, char *out)
+{
+    out[0] = '\0';
+    uint8_t first = 1u;
+    for (uint8_t c = 1u; c <= 12u; c++) {
+        if (mask & FAULT_MASK_BIT(c)) {
+            if (!first) strcat(out, "|");
+            strcat(out, UartLog_FaultName(c));
+            first = 0u;
+        }
+    }
+    if (first) strcpy(out, "-");
+}
+
+/* 主循环上报：打印一次故障事件触发过的全部保护（掩码 + 名称）。
+ * 与 main.c 里按 fault_code 打印的 "FAULT: XXX" 互补——后者只反映最后一个写入者。 */
+void UART_PrintFaultMask(uint16_t mask, uint8_t code)
+{
+    static char masks[192];   /* 静态区：主栈仅 1KB，避免大数组上栈 */
+    static char buf[256];
+    UartLog_MaskToStr(mask, masks);
+    sprintf(buf, "FAULT: code=%u(%s) mask=0x%03X {%s}\r\n",
+            (unsigned)code, UartLog_FaultName(code), (unsigned)mask, masks);
+    UART_SendString(buf);
+}
+
 /* [TEST] 故障记录入队：在 FOC_Update 的故障拦截里调用（20kHz 中断上下文，只写不阻塞） */
 void UartLog_FaultRecord(void)
 {
@@ -445,6 +473,7 @@ void UartLog_FaultRecord(void)
     log_hist[log_hist_head].code  = fault_code;
     log_hist[log_hist_head].mode  = (uint8_t)foc.mode;
     log_hist[log_hist_head].retry = foc.fault_retry_cnt;
+    log_hist[log_hist_head].mask  = fault_mask;   /* 本次事件触发过的所有保护位 */
     log_hist[log_hist_head].st1   = fault_status1;
     log_hist[log_hist_head].st2   = fault_status2;
     log_last_flt_code = fault_code;   /* ISR 侧锁存，供主循环可靠读取 */
@@ -476,7 +505,7 @@ void UartLog_RecoverBlocked(void)
 /* [TEST] 主循环调用：自动上报（故障记录 + 事件 + 周期快照） */
 void UartLog_Poll(void)
 {
-    static char line[288];   /* 静态区：主栈仅 1KB，禁止把大数组放栈上 */
+    static char line[384];   /* 静态区：主栈仅 1KB，禁止把大数组放栈上（放大以容纳故障掩码串） */
     uint32_t now = HAL_GetTick();
 
     /* ---- 0) 上电横幅：只在首次调用打印，输出复位原因（判断复位循环的关键证据）----
@@ -508,9 +537,13 @@ void UartLog_Poll(void)
         uint8_t  er  = log_hist[log_hist_tail].retry;
         uint16_t es1 = log_hist[log_hist_tail].st1;
         uint16_t es2 = log_hist[log_hist_tail].st2;
+        uint16_t emk = log_hist[log_hist_tail].mask;
+        static char mstr[192];   /* 静态区：主栈仅 1KB */
+        UartLog_MaskToStr(emk, mstr);
 
-        sprintf(line, "[FLT] t=%lums code=%u(%s) mode=%u retry=%u ST1=0x%04X ST2=0x%04X lost=%lu\r\n",
+        sprintf(line, "[FLT] t=%lums code=%u(%s) mask=0x%03X{%s} mode=%u retry=%u ST1=0x%04X ST2=0x%04X lost=%lu\r\n",
                 (unsigned long)et, (unsigned)ec, UartLog_FaultName(ec),
+                (unsigned)emk, mstr,
                 (unsigned)em, (unsigned)er, es1, es2, (unsigned long)log_hist_lost);
         UART_SendString(line);
         log_hist_tail = (uint8_t)((log_hist_tail + 1u) & (UARTLOG_HIST - 1u));
@@ -543,12 +576,12 @@ void UartLog_Poll(void)
             en    != log_p_en    || nflt  != log_p_nfault || armed != log_p_armed) {
 
             sprintf(line,
-                "[EVT] t=%lums Mode=%u code=%u(%s) lastFLT=%u retry=%u EN=%u nFAULT=%u armed=%u commRX=%lu Vbus=%.2f\r\n",
+                "[EVT] t=%lums Mode=%u code=%u(%s) lastFLT=%u retry=%u EN=%u nFAULT=%u armed=%u commRX=%lu commSilent=%lu Vbus=%.2f\r\n",
                 (unsigned long)now, (unsigned)mode,
                 (unsigned)code, UartLog_FaultName(code),
                 (unsigned)log_last_flt_code, (unsigned)retry,
                 (unsigned)en, (unsigned)nflt, (unsigned)armed,
-                (unsigned long)comm_rx_count, (double)bus_voltage);
+                (unsigned long)comm_rx_count, (unsigned long)comm_silent_ticks, (double)bus_voltage);
             UART_SendString(line);
 
             log_p_mode = mode;  log_p_code = code;   log_p_retry = retry;
@@ -621,7 +654,7 @@ void UartLog_Poll(void)
         UART_SendString(line);
 
         sprintf(line,
-            "       Vbus=%.2fV[min=%.2f max=%.2f lo<%.0fV:%lu] I=%.2f/%.2f/%.2f i2t=%.1f T=%.1f kthf=%u kthg=%u | CAN rx=%lu tx=%lu tec=%u rec=%u\r\n",
+            "       Vbus=%.2fV[min=%.2f max=%.2f lo<%.0fV:%lu] I=%.2f/%.2f/%.2f i2t=%.1f T=%.1f kthf=%u kthg=%u | CAN rx=%lu tx=%lu tec=%u rec=%u silent=%lu/%u\r\n",
             (double)bus_voltage,
             (double)log_vbus_min, (double)log_vbus_max,
             (double)BUS_UNDERVOLTAGE_THRESHOLD, (unsigned long)log_vbus_lo_cnt,
@@ -629,7 +662,8 @@ void UartLog_Poll(void)
             (double)i2t_accum, (double)ntc_temperature, (unsigned)kth7823_raw_fault_cnt,
             (unsigned)kth7823_unwrap_glitch_cnt,
             (unsigned long)comm_rx_count, (unsigned long)fdcan_tx_count,
-            (unsigned)ec.TxErrorCnt, (unsigned)ec.RxErrorCnt);
+            (unsigned)ec.TxErrorCnt, (unsigned)ec.RxErrorCnt,
+            (unsigned long)comm_silent_ticks, (unsigned)COMM_TIMEOUT_TICKS);
         UART_SendString(line);
 
         /* 统计窗口复位：下一个快照统计新的一秒 */

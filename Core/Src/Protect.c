@@ -21,7 +21,7 @@ static uint32_t enc_arm_tick = 0; // 记录监测起始点
 // 上位机通讯心跳（CAN）：每收到一帧 Protect_CommFeed 递增一次
 volatile uint32_t comm_rx_count = 0;    // 通讯心跳计数
 static uint32_t comm_last_count = 0;    // 上次检测时的心跳基准
-static uint32_t comm_silent_ticks = 0;  // 通讯静默节拍（连续未收到数据的周期数）
+volatile uint32_t comm_silent_ticks = 0;// 通讯静默节拍（连续未收到数据的周期数，供串口观察）
 static uint8_t  comm_armed = 0;         // 收到首帧后置 1，失联保护才生效（未接上位机时不误触发）
 
 // I²t 热积累量（全局，供 FOC.c 恢复分支判断是否仍过热）
@@ -33,14 +33,15 @@ float soft_limit_max  =  3.14159f;  // 默认 +π
 float pos_error_limit =  0.05f;     // 默认位置跟随误差 0.05 rad（约 2.9°，按需调整）
 
 // 关闭三路 PWM 输出，但保持 TIM1 计数器继续运行（所有保护分支统一走这里）
-// 为何必须补回 CEN：HAL_TIM_PWM_Stop 在最后一个通道关闭时会调用 __HAL_TIM_DISABLE，
-// 其守卫条件(CCER 的 CC1E~CC6E / CC1NE~CC4NE 全为 0)此时成立，于是 TIM1 的 CEN 被清零、
-// 计数器停摆 -> 20kHz 更新中断彻底消失 -> FOC_STATE_FAULT 退避恢复(含 DRV8353_Recover)、
-// 故障 LED 指示、control_tick 以及全部 50µs 级保护巡检一并冻结，且 foc.mode 会停留在
-// 故障前的值形成"假状态"。输出安全（CCxE=0 + MOE=0 + DRV8353 EN 拉低进睡眠）与是否
-// 继续计数无关，因此这里关断输出后显式补回 CEN，保住控制回路与保护的可观测性。
 void Protect_StopPWM(void)
 {
+	// 故障掩码汇总：所有保护分支/故障回调都在置好 fault_code 之后调用本函数，
+	// 故在此把"当前触发者"记入 fault_mask（位 n = FAULT_CODE_n）。这样即使同一拍有多个
+	// 保护同时触发、fault_code 被后写覆盖，掩码里仍保留全部触发过的保护，便于区分谁触发。
+	if (fault_code != FAULT_CODE_NONE) {
+		fault_mask |= FAULT_MASK_BIT(fault_code);
+	}
+
 	// 软堵转/过流保护：三相合成电流超阈值则关驱动、停 PWM，并置 fault 标志
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
@@ -110,7 +111,7 @@ void Protect_CommFeed(void)
 }
 
 // 上位机通讯失联保护：连续 COMM_TIMEOUT_TICKS 个控制周期无新帧则停机
-// 原理与编码器失速检测一致：比较心跳计数，无增长则累计静默节拍，超时即保护。
+// 原理与编码器失速检测一致：比较心跳计数，无增长则累计静默节拍，超时即保护
 void Protect_CommTimeoutCheck(void)
 {
     if (!comm_armed) return;   // 尚未收到任何上位机帧：独立运行，不启用失联保护
@@ -295,11 +296,12 @@ void Protect_I2tCheck(void)
 // 保护巡检
 void Protect_FOC(void)
 {
+	// 上位机通讯失联监测：CAN 心跳超时则触发保护
+	Protect_CommTimeoutCheck();
+	// 检测堵转电流
 	Protect_StallCheck();
 	// 编码器读数有效性/断线监测：连续无效读数(0x0000/0xFFFF)则触发保护
 	Protect_EncoderStallCheck();
-	// 上位机通讯失联监测：CAN 心跳超时则触发保护
-	Protect_CommTimeoutCheck();
 	// 过温保护：线圈温度超关断阈值则触发保护
 	Protect_OvertempCheck();
 	// 母线过压/欠压保护：回馈泵升或栅极欠压均需停机

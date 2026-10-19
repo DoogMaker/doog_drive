@@ -47,4 +47,7 @@ void UartLog_Poll(void);
 // [TEST] "恢复被挡"记录（FOC 在 fault_recover_blocked() 返回 1 时调用）；删除本模块时一并删除本行
 void UartLog_RecoverBlocked(void);
 
+// 上报一次故障事件触发过的全部保护掩码（主循环调用，与按 fault_code 打印的 "FAULT: XXX" 互补）
+void UART_PrintFaultMask(uint16_t mask, uint8_t code);
+
 #endif

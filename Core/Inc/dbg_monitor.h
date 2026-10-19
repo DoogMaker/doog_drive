@@ -22,6 +22,7 @@ typedef struct {
     uint8_t  fault_retry_cnt;   // 连续故障次数（指数退避）
     uint16_t fault_status1;     // DRV8353 硬件故障 STATUS1
     uint16_t fault_status2;     // DRV8353 硬件故障 STATUS2
+    uint16_t fault_mask;        // 本次故障事件内触发过的所有保护位（bit=FAULT_CODE_n）
     uint32_t tick;              // HAL_GetTick() 当前毫秒
 
     /* ---- 电流 (A) ---- */

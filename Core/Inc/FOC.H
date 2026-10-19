@@ -44,6 +44,11 @@
 #define FAULT_CODE_SOFT_LIMIT    11  // 软限位（目标位置持续被钳制在限位边界）
 #define FAULT_CODE_COMM_TIMEOUT  12  // 上位机通讯失联（CAN 心跳超时）
 
+// 故障掩码位：位 n（= FAULT_CODE_n，n=1..12）在对应保护触发时置位。
+// 与 fault_code（单值、后写覆盖先写）不同，掩码在一次故障事件内累积所有触发过的保护、互不覆盖，
+// 供上位机区分"到底哪些保护触发了"。主循环上报后与 fault_code 一起清零。
+#define FAULT_MASK_BIT(code)  ((uint16_t)(1u << (code)))
+
 // 统一缓启动斜坡参数（开环/闭环共用，防止上电速度/电压突变冲击）
 #define FOC_SPEED_RAMP_RATE  80.0f   // 速度加速度上限 (rad/s per second)
 #define FOC_VOLT_RAMP_RATE   5.8f    // 开环电压爬升速率 (V per second)
@@ -162,6 +167,7 @@ extern PID_Handle_t pid_position;  // 位置环 PID
 
 // 故障诊断锁存变量（定义于 main.c）
 extern volatile uint8_t  fault_code;      // 当前故障码，主循环上报后清零
+extern volatile uint16_t fault_mask;      // 本次故障事件内触发过的所有保护位（bit=FAULT_CODE_n）
 extern volatile uint16_t fault_status1;   // 硬件故障 STATUS1 锁存（Disable 前读取）
 extern volatile uint16_t fault_status2;   // 硬件故障 STATUS2 锁存
 

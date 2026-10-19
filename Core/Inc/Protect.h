@@ -98,6 +98,10 @@ void Protect_CommDisarm(void);
 // 通讯心跳计数：每收到一帧本节点 CAN 命令帧 +1（接收中断内自增），串口 can 诊断命令读取
 extern volatile uint32_t comm_rx_count;
 
+// 通讯静默节拍：连续多少控制周期（20kHz）未收到新帧，触发阈值 COMM_TIMEOUT_TICKS；
+// 收到新帧即清零，用于串口观察失联保护计时（需 Protect_CommTimeoutCheck 已启用才有意义）
+extern volatile uint32_t comm_silent_ticks;
+
 // 当前失联保护是否已武装（1 = 收到过 CAN 帧、失联检测已生效），串口 can 诊断命令显示
 uint8_t Protect_CommIsArmed(void);
 
