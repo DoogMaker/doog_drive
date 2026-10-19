@@ -5,6 +5,7 @@
 #include "arm_math.h"
 #include "Protect.h"
 #include "dbg_monitor.h"
+#include "motor_control.h"   
 
 void UartLog_FaultRecord(void);      // [TEST] 定义于 uart_cmd.c（故障记录入队）；删除本模块时一并删除本行
 void UartLog_RecoverBlocked(void);   // [TEST] 定义于 uart_cmd.c（恢复被挡诊断）；删除本模块时一并删除本行
@@ -12,8 +13,7 @@ void UartLog_RecoverBlocked(void);   // [TEST] 定义于 uart_cmd.c（恢复被�
 
 #define ALIGN_VOLTAGE       0.6f    // 对齐电压 (V)，用于将转子拉到目标位置
 #define ALIGN_STEP_DELAY    800     // 每步对齐持续时间 (ms)
-#define ALIGN_AVG_MS        200     // 每步末尾用于"平均定位"的时间窗口 (ms)
-                                    // 必须 < ALIGN_STEP_DELAY，且远大于转子残余振荡周期
+#define ALIGN_AVG_MS        200     // 每步末尾用于"平均定位"的时间窗口 (ms)，< ALIGN_STEP_DELAY，且远大于转子残余振荡周期
 
 // 全局变量
 volatile FOC_State foc = {0};    // FOC 状态结构体（跨中断/主循环共享）
@@ -279,7 +279,6 @@ void FOC_SVPWM(void)
 }
 
 /* ==================== 开环"转到指定输出端角度 + 到位悬停保持"（电弹簧）====================
- * 设计要点（完整说明见 docs/CAN上位机控制指令说明.md）：
  *   - RUN  ：开环无位置反馈，靠对"命令电角度速率 target_speed_ramp"按控制节拍定步长积分判到位
  *            （与同一中断内推进 openloop_angle 同源）；输出端机械角 -> 电机轴(×减速比) -> 电角度(×极对数)。
  *   - HOLD ：到位后冻结电角度、改用 d 轴持续通电（与 ALIGN 磁力定位同形态）形成"电弹簧"，
@@ -322,8 +321,7 @@ static void FOC_OL_Release(void)
 static void FOC_OpenLoopMoveHold_Service(void)
 {
 	// 离开开环模式（切模式/保护停机）或收到外部中止请求（如 v=0 释放）时中止悬停并释放输出。
-	// 外部请求由主循环置位、这里在中断内统一消费完成，避免主循环与中断并发写同一状态相互覆盖。
-	// （保护停机是直接改 foc.mode，未经 FOC_SetMode，故这里必须自查模式。）
+	// 外部请求由主循环置位、这里在中断内统一消费完成，避免主循环与中断并发写同一状态相互覆盖
 	uint8_t stop_req = foc.openloop_move_stop_req;
 	if (stop_req) foc.openloop_move_stop_req = 0;
 
@@ -691,12 +689,8 @@ void FOC_Update(void)
 		case FOC_STATE_TORQUE:    // 闭环：力矩（仅电流环）
 		case FOC_STATE_SPEED:     // 闭环：速度（速度环→电流环）
 		case FOC_STATE_POSITION:  // 闭环：位置（位置环→速度环→电流环）
-		{   // 闭环三态按深度递增，直接用 foc.mode 比较决定"目标值从哪一层注入"
+		{   
 			// ★ 角度源必须用"未滤波"的 KTH7823_Angle_Multiturn：
-			//   KTH7823_Angle_Rad 是 sin/cos 一阶低通(α=0.1 @主循环~830Hz)的输出，
-			//   等效群延迟约 12ms —— 10rad/s 时电角度滞后约 145°，闭环必然失控。
-			//   Multiturn 是原始累积角度（连续无界，无需解环绕）；转子静止时两者相等，
-			//   所以 ALIGN(2) 对齐得到的 encoder_offset 在本角度空间下同样有效。
 			mechanical_angle = (KTH7823_Angle_Multiturn - encoder_offset) * encoder_direction;
 			// 电角度 = 机械角度 × 极对数
 			foc.angle = mechanical_angle * MOTOR_POLE_PAIRS;
@@ -829,10 +823,6 @@ void FOC_FaultRecoverProcess(void)
 	DRV8353_Recover();   // 阻塞约 20ms：清故障 + 重写全部配置 + 使能 + 重启三路 PWM
 
 	if (foc.fault_recover_state != FOC_RECOVER_BUSY) {
-		// 恢复过程中又出现故障（中断的故障拦截已把状态置回 IDLE 并重新退避）：
-		// 立即重新关断。DRV8353_Recover() 刚把 EN/PWM 控制脚拉高，不显式关一次会停留在
-		// "驱动使能 + FAULT 态 0 占空比"（三相下桥常通、电机被短接制动）的异常状态。
-		// foc.mode 保持 FAULT，由中断继续退避，无需在此改动模式。
 		DRV8353_Disable();
 		Protect_StopPWM();
 		TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
@@ -943,26 +933,30 @@ void FOC_SetTargetTorque(float torque_Nm)
 	foc.target_torque = torque_Nm;
 }
 
-// LED 状态指示（主循环调用）：运行常亮，待机(IDLE)熄灭，故障(FAULT)闪烁
+// LED 状态机
 void LED_Update(void)
 {
-	switch (foc.mode) {
-		case FOC_STATE_IDLE:
-			Run_OFF();   // 待机：熄灭
-			break;
+	uint32_t now = HAL_GetTick();
 
-		case FOC_STATE_FAULT:
-			// 故障：5Hz 闪烁（进入 FAULT 时已在 FOC_Update 里 Run_OFF 作为起始）
-			if ((HAL_GetTick() - led_blink_tick) >= LED_FAULT_BLINK_HALF_MS) {
-				led_blink_tick = HAL_GetTick();
-				Run_Toggle();
-			}
-			break;
-
-		default:   // ALIGN / OPENLOOP / CLOSEDLOOP：运行
-			Run_ON();   // 运行：常亮
-			break;
+	// 上电自检 3 次失败：控制已锁死，200ms 相位强制定亮/定灭（每拍都写，不会被其它分支覆盖）
+	if (MotorControl_BootIsHwError()) {
+		if (((now / LED_HW_ERROR_BLINK_MS) & 1u) != 0u) Run_ON();
+		else                                            Run_OFF();
+		return;
 	}
+
+	// 故障：5Hz 闪烁（进入 FAULT 时已在 FOC_Update 里 Run_OFF 作为起始）
+	if (foc.mode == FOC_STATE_FAULT) {
+		if ((now - led_blink_tick) >= LED_FAULT_BLINK_HALF_MS) {
+			led_blink_tick = now;
+			Run_Toggle();
+		}
+		return;
+	}
+
+	// 其它：待机(IDLE)熄灭，ALIGN / OPENLOOP / SPEED / POSITION / TORQUE 常亮
+	if (foc.mode == FOC_STATE_IDLE) Run_OFF();
+	else                            Run_ON();
 }
 
 

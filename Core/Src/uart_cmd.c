@@ -219,7 +219,11 @@ static void UART_Test_OpenLoopHold(float hold_vol)
     UART_SendString("Hold on (electric spring)...\r\n");
 
     while ((HAL_GetTick() - t_hold) < TEST_OL_HOLD_MS) {
-        // 阻塞期间必须维持的节奏：喂狗、发串口（编码器刷新已由 TIM3 中断独立完成）
+        // 阻塞期间必须维持的节奏：编码器刷新 + 喂狗 + 发串口。
+        // 刷新已收敛到主循环，本函数阻塞期间主循环不跑，必须自己刷新，
+        // 否则下面的 dev 用到的角度是冻结值（回拉会失效）。
+        KTH7823_UpdateAngle();
+        KTH7823_UpdateSpeed();
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);
 
@@ -236,7 +240,9 @@ static void UART_Test_OpenLoopHold(float hold_vol)
 
             uint32_t t_pull = HAL_GetTick();
             while ((HAL_GetTick() - t_pull) < TEST_OL_HOLD_PULL_TIMEOUT_MS) {
-                // 编码器刷新由 TIM3 中断独立完成，此处只喂狗/发串口
+                // 阻塞期间自己刷新编码器（主循环不跑），再喂狗/发串口
+                KTH7823_UpdateAngle();
+                KTH7823_UpdateSpeed();
                 UART_Tx_Poll();
                 HAL_IWDG_Refresh(&hiwdg);
 
@@ -310,7 +316,10 @@ int UART_Test_OpenLoopMoveAngle(float out_deg)
         last_tick = now;
         moved += foc.target_speed_ramp * (float)MOTOR_POLE_PAIRS * control_dt * (float)dt_ticks;
 
-        // 编码器刷新由 TIM3 中断独立完成（开环不用其值判位），此处只喂狗/发串口
+        // 阻塞期间自己刷新编码器（主循环不跑）：开环不用其值判位，但要维持角度/测速连续，
+        // 避免运动结束后 hold 阶段拿到过期角度。
+        KTH7823_UpdateAngle();
+        KTH7823_UpdateSpeed();
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);  // 阻塞期间喂狗，防 IWDG 复位
         if ((HAL_GetTick() - t0) > TEST_OL_MOVE_TIMEOUT_MS) break;

@@ -34,4 +34,5 @@ drive/foc.o: ..\Core\Src\FOC.C ..\Core\Inc\foc.h ..\Core\Inc\pid.h \
   ..\Core\Inc\drv8353.h ..\Core\Inc\sense.h ..\Core\Inc\KTH7823.h \
   ..\Core\Inc\encoder2.h ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
   ..\Drivers\CMSIS\Include\cmsis_compiler.h ..\Core\Inc\Protect.h \
-  ..\Core\Inc\dbg_monitor.h
+  ..\Core\Inc\dbg_monitor.h ..\Core\Inc\motor_control.h \
+  ..\Core\Inc\spi.h

@@ -45,11 +45,15 @@ static uint16_t spi_exchange_frame(uint16_t tx)
     return rxw;   // HAL 16 位模式已写入完整 16 位
 }
 
-// 读取 KTH7823 原始角度值（16位）
+// 读取 KTH7823 原始角度值（16位）—— 单帧流水线读取
+// 协议：当前帧发送命令，返回的是“上一命令帧的回读”。每拍都发同一个读命令（0x0000），
+//       故本帧的返回值就是上一拍命令对应的角度，等价于旧版“发两帧取第二帧”，但线时减半
+//       （1 帧 16bit @9MHz ≈ 1.78µs，旧版 2 帧 ≈ 3.56µs），仅滞后一帧。
+// CS：每帧独立“拉低→传输→拉高”，两帧之间高电平远大于 50ns 的要求（HAL 调用开销已足够）。
+// 注：流水线第一拍由 KTH7823_Init() 的那次调用建立，其返回值（上电旧值）被丢弃。
 uint16_t KTH7823_ReadAngleRaw(void)
 {
-    spi_exchange_frame(0x0000); // 第一帧：发读指令，返回的是上一次/上电旧值（丢弃）
-    return spi_exchange_frame(0x0000); // 返回本次角度，16 位全为角度值
+    return spi_exchange_frame(0x0000); // 发读命令并直接取回读（= 上一命令帧对应的角度）
 }
 
 // 角度弧度转换
@@ -78,7 +82,8 @@ void KTH7823_Init(void)
     kth7823_unwrap_glitch_cnt = 0; // 复位野值剔除计数
     encoder_update_count = 0;
 
-    //  丢弃首次无效值 + 建立通信 
+    // 建立流水线首拍：单帧协议下这一帧既完成上电通信初始化，也让下一帧能取到有效回读。
+    // 其返回值是上电旧值/无效值，直接丢弃（首次 UpdateAngle 取到的才是本条命令对应的角度）。
     KTH7823_ReadAngleRaw();
     DWT_DelayMs(10);
 }
@@ -140,7 +145,7 @@ void KTH7823_UpdateAngle(void)
     // 输出：多圈总角度
     KTH7823_Angle_Multiturn = angle_unwrapped;
 
-    // 采样心跳计数（中断内递增），供 Protect 判断编码器是否在刷新
+    // 采样心跳计数（主循环每拍递增），供 Protect 判断编码器是否在刷新
     encoder_update_count++;
 }
 
@@ -178,13 +183,6 @@ void KTH7823_UpdateSpeed(void)
     last_speed_tick = now;
 }
 
-/**
- * @brief 编码器刷新入口，供 TIM3 更新中断调用（10kHz/20kHz，与电流采样同相位）
- * @note  中断内为唯一写者（TIM1 控制中断可抢占 TIM3），故角度/速度全局量不会撕裂；
- *        仅依赖 SysTick/DWT，不做任何阻塞等待（SPI 超时在正常 9MHz 下不会触发）。
- */
-void KTH7823_UpdateISR(void)
-{
-    KTH7823_UpdateAngle();   // 读角度 -> 解包裹 -> 滤波 -> 更新多圈角度，并累加采样心跳
-    KTH7823_UpdateSpeed();   // 用 DWT 差分更新速度
-}
+/* 编码器刷新入口已收敛到主循环：main.c 的 while(1) 每轮依次调用
+ * KTH7823_UpdateAngle() + KTH7823_UpdateSpeed()，并 DWT_DelayMs(1) 定 1ms 节拍。
+ * 阻塞式测试命令（串口 ang=）内部也需自行调用这两个函数，见 uart_cmd.c。 */

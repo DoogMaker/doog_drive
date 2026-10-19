@@ -4,7 +4,7 @@
 #include "pid.h"
 #include "drv8353.h"      // DRV8353_Recover / DRV8353_Disable 等
 
-// 运行状态 LED 宏
+// 运行状态 LED 宏（全工程唯一定义处，motor_control.h 不再重复定义）
 // PB9 低电平点亮（共阳接法）：Run_ON=常亮，Run_OFF=熄灭，Run_Toggle=翻转
 #define Run_ON()     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET)
 #define Run_OFF()    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET)
@@ -12,6 +12,8 @@
 
 // 故障 LED 快速闪烁参数：半周期(ms)，亮/灭各占一半 → 约 5Hz 闪烁
 #define LED_FAULT_BLINK_HALF_MS  100
+// 硬件错误（上电自检 3 次失败、控制被锁死）LED 慢闪半周期(ms) → 约 2.5Hz
+#define LED_HW_ERROR_BLINK_MS    200
 
 #define FOC_CLOSEDLOOP_ENABLE 0		// 0 = 禁用闭环（硬件验证阶段使用）  1 = 启用闭环（功能调试阶段打开）
 #define MOTOR_POLE_PAIRS  21  	// 电机极对数
@@ -179,7 +181,7 @@ extern float pos_error_limit;
 void FOC_Init(void);
 void FOC_Update(void);
 void FOC_FaultRecoverProcess(void);   // 故障恢复执行体（主循环调用）：仅此地执行阻塞式 DRV8353_Recover()
-void LED_Update(void);   // LED 状态指示（运行常亮，待机熄灭，故障闪烁，主循环调用）
+void LED_Update(void);   // LED 状态机（20kHz 控制中断内调用）：硬件错误慢闪 > 故障快闪 > 运行常亮/待机熄灭
 
 void FOC_Clark(void);
 void FOC_Park(void);

@@ -70,16 +70,16 @@ void Protect_StallCheck(void)
 }
 
 // 编码器读数有效性/断线监测
-// 原理：KTH7823 的 SPI 读取已移入 TIM3 中断（10kHz）刷新，读到 0x0000/0xFFFF 视为
+// 原理：KTH7823 的 SPI 读取由主循环（≈1kHz）刷新，读到 0x0000/0xFFFF 视为
 //       断线/无磁等无效读数，由 KTH7823_UpdateAngle 累计到 kth7823_raw_fault_cnt
 //       （正常读数立即清零）。本函数在控制中断（20kHz，50µs/拍）内调用，连续异常
 //       读数达到 KTH7823_RAW_FAULT_LIMIT 即判定编码器失效，触发硬件保护。
-// 注：主循环存活由 IWDG 单独保障（阻塞循环也已不再负责编码器刷新），此处不再判定。
+// 注：主循环存活由 IWDG 单独保障，此处只判读数有效性、不判刷新节奏。
 void Protect_EncoderStallCheck(void)
 {
-    // ---- 准备阶段：等 TIM3 中断开始刷新编码器，再观察 ARM_DELAY 后才开始监测 ----
+    // ---- 准备阶段：等主循环开始刷新编码器，再观察 ARM_DELAY 后才开始监测 ----
     if (!enc_armed) {
-        if (encoder_update_count != 0) {                 // 编码器已在中断内刷新
+        if (encoder_update_count != 0) {                 // 编码器已在主循环内刷新
             if (enc_arm_tick == 0) enc_arm_tick = HAL_GetTick();
             else if (HAL_GetTick() - enc_arm_tick > ENCODER_ARM_DELAY_MS) {
                 enc_armed = 1;

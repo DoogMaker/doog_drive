@@ -35,10 +35,10 @@
 #include "fdcan_app.h"
 #include "uart_cmd.h"
 #include "dwt_delay.h"
-#include "kth7823.h"    // KTH7823_UpdateAngle/UpdateSpeed（[TEST] 主循环刷新模式下直接调用）
+#include "kth7823.h"    
 #include "encoder2.h"
 #include "dbg_monitor.h"
-#include "Protect.h"     // Protect_StopPWM（故障时关断输出但保持 TIM1 计数）
+#include "Protect.h"     
 
 
 /* USER CODE END Includes */
@@ -87,7 +87,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 			fault_status1 = DRV8353_ReadReg(DRV8353_REG_STATUS1);
 			fault_status2 = DRV8353_ReadReg(DRV8353_REG_STATUS2);
 			fault_code = FAULT_CODE_HARDWARE;
-			// 立即停止 PWM 输出（硬件保护，必须快！）
+			// 立即停止 PWM 输出
 			DRV8353_Disable();
       Protect_StopPWM();
 			fault_triggered = 1;
@@ -143,12 +143,10 @@ int main(void)
   MX_USART3_UART_Init();
   MX_ADC2_Init();
   MX_IWDG_Init();
-  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 	FDCAN_App_Init();
 	UART_Cmd_Init();
 	MotorControl_Init();
-
 	MotorControl_BootSequence();   // 上电自动执行启动序列
   /* USER CODE END 2 */
 
@@ -171,12 +169,6 @@ int main(void)
 
 		// [TEST] 故障/状态自动串口上报（删除本模块时一并删除本行）
 //		UartLog_Poll();
-		
-		// LED 状态指示：正常运行常亮，故障低频闪烁
-		LED_Update();
-
-		// 上电自检硬件错误(锁死)指示：覆盖 IDLE 熄灭，闪烁提示需检修
-		MotorControl_BootErrorLed();
 
 		// 故障监测：仅做诊断上报，真正的退避/恢复由 FOC_Update 顶部的FOC_STATE_FAULT 状态机接管
     // （fault_triggered 在此不清除，留给 FOC 消费）
@@ -232,7 +224,6 @@ int main(void)
       if (status2 & 0x0002) UART_SendString("FAULT: VGS_HC\r\n");// C 相高侧 MOSFET VGS 驱动故障
       if (status2 & 0x0001) UART_SendString("FAULT: VGS_LC\r\n");// C 相低侧 MOSFET VGS 驱动故障
       }
-      // 本次故障事件触发过的"全部"保护掩码（解决 fault_code 被后写覆盖、分不清谁触发的问题）
       UART_PrintFaultMask(fault_mask, fault_code);
 
       fault_code = FAULT_CODE_NONE;   // 上报完成后清除锁存
@@ -244,7 +235,8 @@ int main(void)
 
 		// 自动实时上报状态
 //		UART_SendStatus();
-
+		
+		// 对齐结果上报
 		UART_ReportAlignResult();
 
 		// 非阻塞发送兜底：发送链路异常（HAL 启动失败/出错）时恢复，正常无开销
@@ -256,14 +248,10 @@ int main(void)
 		// 处理 CAN 消息（多节点：只处理发给本节点 NODE_ID 的帧，过滤器已按 ID 区分）
     FDCAN_App_Process();
 
-#if ENCODER_REFRESH_IN_MAIN_LOOP
-		// [TEST] 编码器刷新改回主循环轮询（旧版本方式，≈1kHz），与 TIM3 中断方案对比
-		// 注意：本模式下 TIM3 不启动（见 motor_control.c），此处为编码器唯一写者；
-		//       控制中断仍按 20kHz 运行，但读到的角度最旧约 1ms。
-		KTH7823_UpdateAngle();   // SPI 读角度 -> 异常读数统计 -> 解包裹/野值剔除 -> 滤波 -> 多圈角
+		// 编码器刷新：主循环读角度 + 测速，20kHz 控制中断读到的最旧角度约 1ms
+		KTH7823_UpdateAngle();   // SPI 单帧流水线读角度 -> 异常读数统计 -> 解包裹/野值剔除 -> 滤波 -> 多圈角
 		KTH7823_UpdateSpeed();   // DWT 差分测速（一阶低通）
-		DWT_DelayMs(1);          // 定 1ms 节拍（≈1kHz），复刻旧版刷新率
-#endif
+		DWT_DelayMs(1);          // 定 1ms 节拍
 
 		// 喂独立看门狗：主循环 1ms 周期喂狗，远小于 1s 超时
 		HAL_IWDG_Refresh(&hiwdg);

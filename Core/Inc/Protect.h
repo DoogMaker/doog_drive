@@ -35,8 +35,8 @@
 #define SOFT_LIMIT_TIMEOUT_TICKS 400   // 目标位置在软限位外持续未收敛的控制周期数（20kHz 下 = 20ms）
 
 // 编码器读数有效性/断线监测阈值
-// 编码器刷新已在 TIM3 中断（10kHz）内完成，主循环存活由 IWDG 单独保障；
-// 判据改为"读数有效性"：连续读到异常原始值（0x0000/0xFFFF）达 KTH7823_RAW_FAULT_LIMIT
+// 编码器刷新由主循环完成（≈1kHz，main.c 的 while(1) 调用 KTH7823_UpdateAngle），主循环存活由 IWDG 单独保障；
+// 判据为"读数有效性"：连续读到异常原始值（0x0000/0xFFFF）达 KTH7823_RAW_FAULT_LIMIT
 // 次即判定编码器断线/无磁失效（该阈值定义在 kth7823.h，本检测在 20kHz 控制中断内调用）。
 #define ENCODER_ARM_DELAY_MS  100    // 编码器开始刷新后再观察 100ms，避免上电误触发
 

@@ -15,10 +15,6 @@ extern "C" {
 #include <foc.h>
 #include <sense.h>
 
-// LED指示灯
-#define Run_ON()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET)
-#define Run_OFF() HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET)
-
 extern volatile uint32_t control_tick;   // 控制节拍计数
 extern float control_dt;                 // 控制周期 (秒)
 
@@ -31,8 +27,8 @@ void MotorControl_BootSequence(void);
 // 控制命令门控：1=放行 0=拒绝（硬件错误锁死后拒绝控制命令，诊断命令不调用本函数）
 uint8_t MotorControl_CommandGate(void);
 
-// 硬件错误 LED 指示：主循环在 LED_Update() 之后调用，覆盖 IDLE 熄灭以示需检修
-void MotorControl_BootErrorLed(void);
+// 上电自检是否失败（1=硬件错误、控制命令已锁死）：供 FOC.C 的 LED 状态机读取
+uint8_t MotorControl_BootIsHwError(void);
 
 #ifdef __cplusplus
 }

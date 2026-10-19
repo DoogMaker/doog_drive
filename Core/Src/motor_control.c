@@ -16,7 +16,7 @@
 
 #define BOOT_SC_ATTEMPT_MAX    3      // 参数自检总尝试次数（计入第一次，共 3 次）
 #define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
-#define BOOT_DEV_ERR_BLINK_MS  200    // 硬件错误(锁死)时 LED 闪烁半周期(ms)
+
 
 extern float manual_voltage;   // 手动给定电压 (V)（定义于 main.c）
 extern float manual_speed;     // 手动给定速度 (rad/s)（定义于 main.c）
@@ -69,11 +69,8 @@ void MotorControl_Init(void)
 		//启动 TIM1 基本计数
 		HAL_TIM_Base_Start_IT(&htim1); 
 
-    // 启动 TIM3 更新中断（编码器刷新，10kHz，与电流采样同相位）
-    // [TEST] 主循环刷新模式下不启动 TIM3：编码器改由 main.c 的 while(1) 轮询（约 1kHz）
-#if !ENCODER_REFRESH_IN_MAIN_LOOP
-    HAL_TIM_Base_Start_IT(&htim3);
-#endif
+    // 编码器刷新不占用任何定时器：由 main.c 的 while(1) 每轮调用 KTH7823_UpdateAngle/UpdateSpeed
+    // （1ms 节拍，≈1kHz）。
 		
     //ADC自校准
     HAL_ADCEx_Calibration_Start(&hadc1,ADC_DIFFERENTIAL_ENDED);
@@ -104,16 +101,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     // 执行 FOC 算法（电流偏移校准完成前不执行，避免初始化期误触发保护）
     if (motor_ready) {
         FOC_Update();
+        LED_Update();   // LED 状态机：20kHz 持续刷新，不受主循环阻塞影响
     }
 
     control_tick++;
   }
-#if !ENCODER_REFRESH_IN_MAIN_LOOP
-  else if (htim->Instance == TIM3) {
-	
-    KTH7823_UpdateISR();
-  }
-#endif
 }
 
 
@@ -158,16 +150,11 @@ uint8_t MotorControl_CommandGate(void)
     return 1;
 }
 
-/* 硬件错误 LED 指示（主循环调用）：boot_hw_error=1 时闪烁提示需检修，
- * 需在 LED_Update() 之后调用以覆盖其 IDLE 熄灭指示 */
-void MotorControl_BootErrorLed(void)
+/* 上电自检是否失败（硬件错误、控制命令被锁死）
+ * 供 FOC.C 的 LED 状态机（20kHz 中断内）读取，避免跨文件访问 static 变量 */
+uint8_t MotorControl_BootIsHwError(void)
 {
-    static uint32_t tick = 0;
-    if (!boot_hw_error) return;
-    if ((HAL_GetTick() - tick) >= BOOT_DEV_ERR_BLINK_MS) {
-        tick = HAL_GetTick();
-        Run_Toggle();
-    }
+    return boot_hw_error;
 }
 
 // 上电自动执行启动序列
@@ -214,8 +201,7 @@ void MotorControl_BootSequence(void)
         manual_speed      = 0.0f;
         foc.target_speed  = 0.0f;
         foc.target_torque = 0.0f;
-        FOC_SetMode(FOC_STATE_IDLE);
-        LED_Update();
+        FOC_SetMode(FOC_STATE_IDLE);   // LED 由 20kHz 中断状态机处理（boot_hw_error=1 → 慢闪）
 
         UART_SendString("[BOOT] ERROR: HARDWARE ERROR - driver self-check failed 3 times. "
                         "Entered IDLE. Maintenance required.\r\n");
@@ -223,13 +209,12 @@ void MotorControl_BootSequence(void)
         return;
     }
 
-    // 自检通过：停止输出、清零给定，进入 IDLE 等待控制（不做上电自动对齐）
+    // 自检通过：停止输出、清零给定，进入 IDLE 等待控制
     manual_voltage    = 0.0f;
     manual_speed      = 0.0f;
     foc.target_speed  = 0.0f;
     foc.target_torque = 0.0f;
-    FOC_SetMode(FOC_STATE_IDLE);
-    LED_Update();
+    FOC_SetMode(FOC_STATE_IDLE);   // LED 由 20kHz 中断状态机处理（IDLE → 熄灭）
 
     UART_SendString("[BOOT] Driver param check PASS. Entered IDLE, waiting for control.\r\n");
     UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");

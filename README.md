@@ -35,7 +35,6 @@
 | **MCU** | STM32G474RBT6（LQFP64，Cortex-M4F，128KB Flash / 128KB RAM） |
 | **系统时钟** | HSE 8MHz → PLL → **SYSCLK 72MHz**；HCLK 72M / PCLK1 72M / PCLK2 36M |
 | **TIM1** | 三相 PWM，中心对齐模式1，PSC=0 / ARR=3599 → **10kHz PWM**、**20kHz 更新中断**，CH1/2/3（PA8/PA9/PA10），死区 0（由 DRV8353 内部 50ns 死区承担），TRGO=UPDATE（供 ADC 触发） |
-| **TIM3** | 编码器刷新，Trigger Mode + ITR0(=TIM1_TRGO) 由 TIM1 首个更新沿启动后自由运行，ARR=7199 → **10kHz** 调用 KTH7823 刷新。⚠️ `[TEST]` 当前 `ENCODER_REFRESH_IN_MAIN_LOOP = 1`：TIM3 **不启动**，编码器改由主循环 ≈1kHz 刷新（见 [更新记录 2026-10-19](#2026-10-19--test-编码器刷新位置开关tim3-中断--主循环轮询当前切到主循环用于对比测试)）；置 `0` 即恢复本行描述 |
 | **ADC1** | 12 位扫描 4 通道，`T1_TRGO` 上升沿触发，DMA 循环：CH2(PA1)=A 相电流、CH3(PA2)=B 相电流、CH8(PC2)=母线电压、CH4(PA3)=MOS 温度 |
 | **ADC2** | 12 位单通道 CH12(PB2)，同 `T1_TRGO` 触发：线圈 NTC 温度 |
 | **DMA1** | Ch1/Ch2 = ADC1/ADC2 循环搬运；Ch3 = USART3_TX、Ch4 = USART3_RX（循环） |
@@ -46,7 +45,7 @@
 | **USART3** | **115200-8N1**，PB10(TX)/PB11(RX)，RX DMA 循环 + IDLE 空闲中断收帧 |
 | **IWDG** | 独立看门狗，预分频 256、Reload=125 → 超时 **约 1s**（主循环 1ms 周期喂狗） |
 | **GPIO / EXTI** | `ENABLE`(PA11，DRV8353 使能，低有效默认关)、`nFAULT`(PA12，下降沿 EXTI，优先级最高 0)、`LED`(PB9，低点亮)、`PWM_COTR`(PB12，DRV8353 PWM 控制脚)、三个片选 |
-| **中断优先级** | EXTI15_10 = 0 > TIM1(20kHz) = 1 > TIM3(10kHz) = 2 > DMA/FDCAN/USART3 = 3 |
+| **中断优先级** | EXTI15_10 = 0 > TIM1(20kHz) = 1 > DMA/FDCAN/USART3 = 3 |
 | **延时** | `dwt_delay.c` 基于内核 DWT CYCCNT 的 µs/ms 精确延时（替代 `HAL_Delay`） |
 
 ### 主要外置器件
@@ -55,7 +54,7 @@
 |---|---|---|
 | 栅极驱动 | **DRV8353F**（SPI 版） | 3x PWM 模式、过流关断全部半桥；TDRIVE 1000ns，灌电流>拉电流抗直通；OCP 死区 50ns / 锁存模式 / 1.0V VDS 阈值；**内部 CSA 禁用**（改用外部 INA240）；软件可读回自检（`DRV8353_SelfCheck`） |
 | 电流采样 | **INA240A1** ×2 | A/B 相各一路，增益 20，采样电阻 1mΩ，VREF 偏置 1.65V（3.3V/2），理论上量程约 ±82A；C 相由基尔霍夫合成；上电 64 次平均求零偏 |
-| 磁编码器 | **KTH7823** | 电机轴角度，SPI1 读数（两帧连发取第二帧），**16 位**分辨率（65536 刻度/圈），sin/cos 一阶低通 + atan2 + 多圈解包裹；连续读到 0x0000/0xFFFF 达 8 次判失效 |
+| 磁编码器 | **KTH7823** | 电机轴角度，SPI1 **单帧流水线**读取（发 1 帧命令，返回上一命令帧的回读；1 帧 ≈1.78µs @9MHz），**16 位**分辨率（65536 刻度/圈），sin/cos 一阶低通 + atan2 + 多圈解包裹；连续读到 0x0000/0xFFFF 达 8 次判失效；刷新在主循环（≈1kHz），不占用定时器 |
 | 第二编码器 | **待定**（`encoder2.c` 为框架 + TODO 占位） | 减速器输出端角度，SPI3，作为位置环角度源 |
 | 功率 MOSFET | 见 `数据手册/MOSFET.pdf` | 驱动设计按 Qg ≈ 37nC 选取驱动电流 |
 | 电机 | 21 极对、减速比 12.5、额定 14A | 参数见 `FOC.H` |
@@ -66,9 +65,9 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.c` | 时钟 / 外设初始化、主循环调度（`MotorControl_BootErrorLed()`、故障码上报、串口 / CAN 处理、**`[TEST]` 主循环编码器刷新块**）、nFAULT EXTI 回调 |
-| `motor_control.c` | 计算 `control_dt`、初始化各驱动、TIM1/TIM3 中断回调（20kHz 跑电流采样 + `FOC_Update`，10kHz 刷新编码器 —— **受 `ENCODER_REFRESH_IN_MAIN_LOOP` 控制，当前测试模式下 TIM3 不启动**）；**上电启动序列**（DRV8353 参数写入自检重试 → 参数校验打印 → IDLE，含硬件错误锁死门控与 LED 指示；**不含自动对齐**） |
-| `FOC.C` | FOC 核心：状态机、变换、SVPWM、三级 PID 级联、开环转角度/悬停、故障退避与恢复握手、LED |
+| `main.c` | 时钟 / 外设初始化、主循环调度（故障码上报、串口 / CAN 处理、**编码器刷新 `KTH7823_UpdateAngle/UpdateSpeed` + 1ms 节拍**）、nFAULT EXTI 回调（**不驱动 LED**） |
+| `motor_control.c` | 计算 `control_dt`、初始化各驱动、TIM1 中断回调（20kHz 跑电流采样 + `FOC_Update` + **`LED_Update()` LED 状态机**；`motor_ready` 后启动，故上电初始点亮保持到控制就绪）；**上电启动序列**（DRV8353 参数写入自检重试 → 参数校验打印 → IDLE，含硬件错误锁死门控；**不含自动对齐**） |
+| `FOC.C` | FOC 核心：状态机、变换、SVPWM、三级 PID 级联、开环转角度/悬停、故障退避与恢复握手、LED 状态机（20kHz 中断内，硬件错误慢闪 > 故障快闪 > 运行常亮） |
 | `PID.c` | 通用位置式 PID（微分先行 + clamping 抗饱和） |
 | `Protect.c` | 全部软件保护巡检 `Protect_FOC()`、统一停机入口 `Protect_StopPWM()` |
 | `sense.c` | ADC → 物理量换算（三相电流 / 母线电压 / NTC 温度）、零偏标定 |
@@ -712,61 +711,119 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 
 ## 更新记录
 
-### 2026-10-19 — [TEST] 编码器刷新位置开关：TIM3 中断 ↔ 主循环轮询（当前切到主循环，用于对比测试）
+### 2026-10-19 — LED 状态机整体移入 20kHz 控制中断（修饰阻塞期卡死与硬件错误闪烁失效）
 
-**背景**：现有固件把 KTH7823 的 SPI 读取放在 **TIM3 10kHz 中断**里（与电流采样同相位）；旧版本是在**主循环 ~1kHz 轮询**。
-为对比两种刷新方式对测速噪声、开环/闭环动态的影响，新增一个**编译期开关**临时切回主循环方式，测试结束可一键回退或整体删除。
+**问题（改动前）**
+
+1. `LED_Update()` 只在主循环调用，而主循环存在长时间阻塞：串口 `ang=` 测试命令（数百 ms ~ 数秒）、
+   `FOC_FaultRecoverProcess()` 里的 `DRV8353_Recover()`（≈20ms）、`MotorControl_BootSequence()`。
+   阻塞期间 LED 停在最后一拍的状态，故障也不会闪。
+2. `MotorControl_BootErrorLed()` 每 200ms 只 `Run_Toggle()` 一次，而主循环每轮先执行 `LED_Update()`
+   （IDLE → `Run_OFF()` 强制定灭）。结果翻转点亮后约 1ms 就被下一轮熄灭 → **实际亮 1ms / 灭 199ms，肉眼几乎不可见**。
+3. LED 有 4 个写者（主循环 `LED_Update`、主循环 `BootErrorLed`、20kHz 中断里的故障 `Run_OFF` 与恢复 `Run_ON`），
+   状态机跨两个上下文分裂，难以推理。
 
 **改动**
 
-- `Core/Inc/kth7823.h`：新增开关宏（默认值 `1`）
-  ```c
-  #define ENCODER_REFRESH_IN_MAIN_LOOP   1    // 1 = 主循环刷新（测试）；0 = TIM3 中断刷新（原方案）
-  ```
-  宏上方注释写清了两种取值含义、测试带来的影响，以及完整删除方法。
-- `Core/Src/motor_control.c`：把 TIM3 的"启动 + 执行"成对包进条件编译
-  - `MotorControl_Init()` 中 `HAL_TIM_Base_Start_IT(&htim3);` → `#if !ENCODER_REFRESH_IN_MAIN_LOOP`
-  - `HAL_TIM_PeriodElapsedCallback()` 中 `else if (htim->Instance == TIM3) { KTH7823_UpdateISR(); }` → 同一条件
-- `Core/Src/main.c`：主循环末尾（`FDCAN_App_Process()` 之后、`HAL_IWDG_Refresh()` 之前）新增
-  ```c
-  #if ENCODER_REFRESH_IN_MAIN_LOOP
-  		KTH7823_UpdateAngle();
-  		KTH7823_UpdateSpeed();
-  		DWT_DelayMs(1);          // 定 1ms 节拍（≈1kHz），复刻旧版刷新率
-  #endif
-  ```
-  并显式新增 `#include "kth7823.h"`（保证宏与函数声明可见）。
+1. **状态机整体移入 20kHz 控制中断**（`Core/Src/motor_control.c`）：
+   `HAL_TIM_PeriodElapsedCallback()` 的 TIM1 分支改为 `if (motor_ready) { FOC_Update(); LED_Update(); }`。
+   放在 `motor_ready` 之后，使**上电初始电平（`gpio.c` 写低 = 点亮）保持不变**，直到控制就绪才由状态机接管。
+2. **`LED_Update()` 重写为三级优先级**（`Core/Src/FOC.C`，每拍 50µs 刷新）：
+   ```c
+   if (MotorControl_BootIsHwError()) { 200ms 相位强制定亮/定灭; return; }   // 硬件错误慢闪 2.5Hz
+   if (foc.mode == FOC_STATE_FAULT)  { 100ms 翻转一次; return; }            // 故障快闪 5Hz
+   foc.mode == FOC_STATE_IDLE ? Run_OFF() : Run_ON();                       // 待机灭 / 其余常亮
+   ```
+   硬件错误分支**每拍都写**（按 `HAL_GetTick()/200` 相位），不会被其它分支覆盖，修复了"后写覆盖"失效的问题。
+3. **新增只读接口** `MotorControl_BootIsHwError()`（`motor_control.c/.h`），供 `FOC.C` 读取 `boot_hw_error`；
+   删除 `MotorControl_BootErrorLed()`、`BOOT_DEV_ERR_BLINK_MS` 及主循环中的两处 LED 调用
+   （`main.c` 的 `LED_Update()` / `MotorControl_BootErrorLed()`、启动序列里的两处 `LED_Update()`）。
+4. **`Run_*` 宏统一**：只保留 `FOC.H` 中的 `Run_ON / Run_OFF / Run_Toggle`，删除 `motor_control.h` 里的重复定义；
+   新增 `LED_HW_ERROR_BLINK_MS = 200`。
 
-**两种取值下的行为**
+**效果**
 
-| 宏值 | TIM3 | 编码器刷新 | 主循环周期 |
-|---|---|---|---|
-| `1`（当前） | 不启动（中断不触发） | `main.c` 主循环调用 `UpdateAngle + UpdateSpeed`，≈**1kHz** | ≈1ms |
-| `0`（原方案） | 启动，10kHz | `KTH7823_UpdateISR()`（内部 `UpdateAngle + UpdateSpeed`） | 无额外延时 |
+| 场景 | 改动前 | 改动后 |
+|---|---|---|
+| 串口 `ang=` 阻塞数秒 | LED 冻结 | 20kHz 持续刷新，状态实时 |
+| `DRV8353_Recover()` ≈20ms | 冻结 | 持续刷新 |
+| 上电自检失败（硬件错误） | 亮 ≈1ms / 灭 199ms（几乎看不见） | **200ms 定亮 / 200ms 定灭（2.5Hz 慢闪）** |
+| FAULT | 闪烁依赖主循环 | 20kHz 内 100ms 翻转（5Hz），不受阻塞影响 |
+| 上电初始电平 | PB9 点亮 | **保持点亮**（`gpio.c` 未改，状态机在 `motor_ready` 后才接管） |
 
-- 两种取值都是**单写者**：`KTH7823_UpdateAngle/UpdateSpeed` 只在其中一个上下文被调用，不存在两处并发刷新同一组滤波/解包裹静态变量。
-- 20kHz 控制中断（FOC / 保护）始终运行，宏=1 时读到的最旧角度约 **1ms**。
+- 开销：20kHz 下每拍 `HAL_GetTick()` 读 + 一次除法 + GPIO 写，合计约百纳秒级，CPU 占用可忽略。
+- LED 语义仍以 `foc.mode` 为准（`OPENLOOP` 但 `v=0` 时也常亮），不代表"实际有出力"；如需改为出力指示可后续单独调整。
 
-**影响与注意**
+**验证**：`arm-none-eabi-gcc -fsyntax-only` 编译 `Core/Src` 全部源文件 0 error；全工程已无 `MotorControl_BootErrorLed` / `BOOT_DEV_ERR_BLINK_MS` 引用；Keil 完整编译与实机观察待确认。
 
-- `SPEED_FILTER_ALPHA = 0.15`、`ANGLE_FILTER_ALPHA = 0.10` 原本按 10kHz 刷新调参；降到 1kHz 后等效时间常数放大约 **10 倍**、测速噪声变大。
-  **系数未做修改**（否则失去对比意义），属于本次测试需要观察的差异。
-- 主循环增加 `DWT_DelayMs(1)` 后，CAN / 串口命令处理节奏约 1kHz；CAN 接收队列 16 帧深，正常发帧率（≤1kHz）下不会丢命令。
-- 保护逻辑**未改**：`Protect_EncoderStallCheck()` 判据仍是"连续读到 `0x0000/0xFFFF` 达 `KTH7823_RAW_FAULT_LIMIT`（8 次）"，
-  与刷新位置无关；`encoder_update_count` 仍由 `KTH7823_UpdateAngle()` 递增，武装条件（等到首次刷新 + 100ms 观察窗）两种方式都满足。
-- `uart_cmd.c` 阻塞式测试函数里的注释仍写"编码器刷新已由 TIM3 中断独立完成"，宏=1 时该描述暂不成立，**无功能影响**。
-- 未做编译验证（本机无 ARM 工具链），需在 Keil 中编译确认；已静态核对调用点与 IDE 诊断（0 error / 0 warning）。
+**关联文件**：`Core/Inc/FOC.H`、`Core/Src/FOC.C`、`Core/Src/motor_control.c`、`Core/Inc/motor_control.h`、`Core/Src/main.c`（`gpio.c` 未改，上电点亮保留）。
 
-**回退与删除**
+### 2026-10-19 — 编码器改为单帧流水线读取，并彻底移除定时器中断刷新链路
 
-- **恢复原方案**（推荐）：把 `ENCODER_REFRESH_IN_MAIN_LOOP` 改为 `0`，其它代码无需改动。
-- **永久删除测试代码**：删掉宏注释块与宏定义 + `main.c` 的 `#if` 块（及新增的 `#include "kth7823.h"`）
-  + `motor_control.c` 两处 `#if !ENCODER_REFRESH_IN_MAIN_LOOP / #endif` 包裹（恢复为无条件执行）。
+**背景与约束**
 
-**测试期可观察量**：串口 `status`（Mode 字段）、`can` 诊断、`encoder_update_count`、`kth7823_raw_fault_cnt`、
-`kth7823_unwrap_glitch_cnt`、`KTH7823_Speed_Rads`。
+- KTH7823 的 SPI **最高 SCLK 为 10MHz**，现有 9MHz（PCLK2 36MHz ÷ 4）已接近上限，**不能再靠提频**提速。
+- 协议是**流水线**：当前帧发送命令，返回的是**上一命令帧的回读**；且 **CS 不允许连续拉低**，两帧之间必须有 **≥50ns 高电平**。
+- 原方案为 TIM3 10kHz 中断刷新编码器（`KTH7823_UpdateISR`），额外占用一个定时器与一条中断，且打断了控制的时序一致性分析。
 
-**关联文件**：`Core/Inc/kth7823.h`、`Core/Src/main.c`、`Core/Src/motor_control.c`。
+**改动**
+
+1. **单帧流水线读取**（`Core/Src/KTH7823.c`）
+   ```c
+   uint16_t KTH7823_ReadAngleRaw(void)
+   {
+       return spi_exchange_frame(0x0000);   // 发读命令，直接取回读（= 上一命令帧对应的角度）
+   }
+   ```
+   - 旧实现"发 2 帧、丢第 1 帧、取第 2 帧"，现改为"每拍发 1 帧、直接用返回值"：连续发送同一读命令时，返回值始终是上一拍命令对应的角度，**语义等价，仅滞后一帧**（≈1.78µs）。
+   - 线时 **3.56µs → 1.78µs**；CS 仍每帧"拉低→传输→拉高"，HAL 调用开销远大于 50ns，满足帧间高电平要求。
+   - `KTH7823_Init()` 中保留一次读取，用于丢弃上电无效值并**建立流水线首拍**。
+   - **未改** SPI 分频（仍 9MHz）、未改 `HAL_SPI_TransmitReceive`、未做寄存器级改造。
+2. **移除定时器刷新链路（全工程无 TIM3）**
+   - `Core/Src/main.c`：删除 `MX_TIM3_Init();` 调用。
+   - `Core/Src/motor_control.c`：删除 `HAL_TIM_Base_Start_IT(&htim3);` 与 `HAL_TIM_PeriodElapsedCallback()` 中的 TIM3 分支；回调只剩 TIM1（20kHz 电流采样 + `FOC_Update`）。
+   - `Core/Src/tim.c` / `Core/Inc/tim.h`：删除 `htim3` 句柄、`MX_TIM3_Init()`、`HAL_TIM_Base_MspInit/MspDeInit` 的 TIM3 分支（含 TIM3 时钟与 `TIM3_IRQn` 的 NVIC 配置）及其声明。
+   - `Core/Src/stm32g4xx_it.c` / `Core/Inc/stm32g4xx_it.h`：删除 `extern htim3`、`TIM3_IRQHandler()` 与原型。
+   - `Core/Src/KTH7823.c` / `Core/Inc/kth7823.h`：删除 `KTH7823_UpdateISR()` 定义与声明。
+3. **刷新路径唯一化**（`Core/Src/main.c`）
+   主循环每轮**无条件**执行（`FDCAN_App_Process()` 之后、`HAL_IWDG_Refresh()` 之前）：
+   ```c
+   KTH7823_UpdateAngle();   // 单帧流水线读角度 -> 异常读数统计 -> 解包裹/野值剔除 -> 滤波 -> 多圈角
+   KTH7823_UpdateSpeed();   // DWT 差分测速（一阶低通）
+   DWT_DelayMs(1);          // 定 1ms 节拍（≈1kHz）
+   ```
+   不再有任何编译期开关，`KTH7823_UpdateAngle/UpdateSpeed` 全工程只有"主循环 + 串口阻塞测试函数"两类调用点，不存在并发刷新。
+4. **阻塞式串口测试命令补刷新**（`Core/Src/uart_cmd.c`）
+   串口 `ang=`（开环转角度/保持/回拉）在**主循环里阻塞**执行；原来依赖定时器中断刷新编码器，链路移除后必须自刷新，否则回拉判据拿到的是冻结角度。三个阻塞循环（运动 / 保持 / 回拉）内均已补 `KTH7823_UpdateAngle(); KTH7823_UpdateSpeed();`，节奏仍受 `DWT_DelayMs(1)` 约束。
+5. **注释同步**：`Protect.c`、`Protect.h`、`dbg_monitor.h`、`KTH7823.c` 中"编码器刷新由定时器中断完成"一类描述统一改为"主循环刷新"。
+
+**效果**
+
+| 项 | 旧（2 帧 + 定时器中断） | 新（1 帧 + 主循环） |
+|---|---|---|
+| 单次读取线时 | 3.56 µs | **1.78 µs** |
+| 单次刷新总耗时（含 HAL / 滤波） | ≈10~13 µs | **≈6~8 µs** |
+| 刷新率 | 10 kHz（TIM3 中断） | ≈**1 kHz**（`DWT_DelayMs(1)` 决定） |
+| 20kHz 控制中断看到的角度年龄 | ≤100 µs | 最旧 ≈**1 ms** |
+| 占用定时器 / 中断 | TIM3 + `TIM3_IRQn` | 无 |
+
+- CPU 占用：1kHz 下编码器刷新总耗时约 6~8µs/ms，**不足 1%**。
+- 角度滞后：返回值比旧实现多滞后一个命令帧（≈1.78µs），对 1kHz 刷新、保护判据均无实际影响。
+- 保护逻辑未改：`Protect_EncoderStallCheck()` 仍按 `kth7823_raw_fault_cnt ≥ KTH7823_RAW_FAULT_LIMIT`（8 次无效读数）判失效，`encoder_update_count` 仍由 `KTH7823_UpdateAngle()` 递增。
+
+**验证**
+
+- 用 `arm-none-eabi-gcc -fsyntax-only`（`-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DSTM32G474xx -DUSE_HAL_DRIVER`）编译 `Core/Src` 全部源文件：**0 error**。
+- 全工程检索确认已无 `TIM3` / `htim3` / `MX_TIM3_Init` / `KTH7823_UpdateISR` 引用。
+- 仍需在 Keil 中完整编译、烧录验证；可用逻辑分析仪抽查 CS 帧间高电平 ≥50ns（HAL 结构下天然满足）。
+
+**注意事项**
+
+- **CubeMX**：`Drive.ioc` 中的 TIM3 配置（`Mcu.IP12=TIM3`、`NVIC.TIM3_IRQn`、`TIM3.*` 参数）需在 CubeMX 中**手动删除**，否则重新生成工程会把 TIM3 初始化代码加回来。
+- 如需进一步提高刷新率，可后续单独评估（当前已不占定时器，只剩主循环调度抖动与滤波系数两项限制）；本轮按需求保持 1kHz 节拍、未改滤波系数。
+- 首拍语义：上电后第一次 `KTH7823_UpdateAngle()` 拿到的是 `KTH7823_Init()` 那一帧命令对应的角度（有效，滞后一帧）。
+
+**关联文件**：`Core/Inc/kth7823.h`、`Core/Src/KTH7823.c`、`Core/Src/main.c`、`Core/Src/motor_control.c`、`Core/Src/tim.c`、`Core/Inc/tim.h`、`Core/Src/stm32g4xx_it.c`、`Core/Inc/stm32g4xx_it.h`、`Core/Src/uart_cmd.c`、`Core/Inc/Protect.h`、`Core/Src/Protect.c`、`Core/Inc/dbg_monitor.h`。
 
 ### 2026-10-16 — 故障掩码 `fault_mask`：一次故障事件记全所有触发保护 + 失联计时可观测
 
