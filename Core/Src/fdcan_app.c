@@ -394,7 +394,7 @@ static void FDCAN_HandleCommand(const FDCAN_RxFrame_t *msg)
 
         case CMD_GET_OL_STATUS:
             // 查询开环动作状态：不受开环门控限制，任意模式和状态均可查询，立即回一帧独立状态帧
-            FDCAN_SendOLStatus();
+            FDCAN_SendOLStatus(0);  // byte7=0：查询响应
             break;
 
         case CMD_GET_STATUS:
@@ -423,6 +423,12 @@ void FDCAN_App_Process(void)
     FDCAN_RxFrame_t frame;
     while (FDCAN_Rx_Pop(&frame)) {
         FDCAN_HandleCommand(&frame);
+    }
+
+    // 转动到位事件：状态机在 RUN→HOLD 时置位，这里在主循环上下文统一发一帧 0x300（byte7=1）
+    if (arrive_report_pending) {
+        arrive_report_pending = 0;
+        FDCAN_SendOLStatus(1);
     }
 }
 
@@ -491,7 +497,7 @@ static int16_t fd_sat_i16(float v)
  *        byte7   : 保留 0
  *        注：输出端角度是由电机轴多圈机械角推算的相对量（输出端编码器未启用），非绝对零点。
  */
-void FDCAN_SendOLStatus(void)
+void FDCAN_SendOLStatus(uint8_t evt)
 {
     const float gear = GEAR_RATIO_OUT2MOTOR;
 
@@ -522,7 +528,7 @@ void FDCAN_SendOLStatus(void)
     tx_data[5] = volt_int & 0xFF;
     tx_data[6] = (volt_int >> 8) & 0xFF;
 
-    tx_data[7] = 0;
+    tx_data[7] = evt;   // byte7=0:查询响应, 1:到位事件报告
 
     // 发送：TX FIFO 满或总线异常时直接丢弃本帧，绝不阻塞主循环（自动重传已关闭）
     // 返回值计入诊断（串口 can 命令可见：TXfail 持续增长说明 FIFO 满或外设不在运行态）

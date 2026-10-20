@@ -1,4 +1,4 @@
-#include "encoder2.h"
+#include "KTH7823_2.h"
 #include "arm_math.h"
 #include "spi.h"
 #include "dwt_delay.h"   // DWT_DelayMs

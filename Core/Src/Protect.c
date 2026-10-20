@@ -1,7 +1,7 @@
 #include "Protect.h"
 #include "DRV8353.H"
 #include "KTH7823.h"
-#include "encoder2.h"
+#include "kth7823_2.h"
 #include "sense.h"
 #include "tim.h"
 #include "foc.h"

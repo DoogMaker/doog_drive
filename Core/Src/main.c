@@ -36,7 +36,7 @@
 #include "uart_cmd.h"
 #include "dwt_delay.h"
 #include "kth7823.h"    
-#include "encoder2.h"
+#include "kth7823_2.h"
 #include "dbg_monitor.h"
 #include "Protect.h"     
 

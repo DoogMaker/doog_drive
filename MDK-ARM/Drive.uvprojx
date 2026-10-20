@@ -405,11 +405,6 @@
               <FilePath>..\Core\Src\dwt_delay.c</FilePath>
             </File>
             <File>
-              <FileName>encoder2.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\encoder2.c</FilePath>
-            </File>
-            <File>
               <FileName>fdcan_app.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\fdcan_app.c</FilePath>
@@ -503,6 +498,11 @@
               <FileName>stm32g4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
+            </File>
+            <File>
+              <FileName>kth7823_2.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\kth7823_2.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -642,9 +642,6 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>::CMSIS</GroupName>
-        </Group>
-        <Group>
           <GroupName>Middlewares/Library/DSP Library/DSP Library</GroupName>
           <GroupOption>
             <CommonProperty>
@@ -741,6 +738,9 @@
               </FileOption>
             </File>
           </Files>
+        </Group>
+        <Group>
+          <GroupName>::CMSIS</GroupName>
         </Group>
       </Groups>
     </Target>

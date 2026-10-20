@@ -75,6 +75,6 @@ extern volatile uint32_t fdcan_last_rx_ms;       // 最后一帧到达时刻 (HA
 void FDCAN_App_Init(void);
 void FDCAN_App_Process(void);    // 主循环中调用，处理接收到的指令 + 总线关闭自动恢复
 void FDCAN_SendStatus(void);     // 发送状态反馈
-void FDCAN_SendOLStatus(void);   // 发送开环动作状态反馈（命令 0x09 的响应帧，ID=FBK_OL_FRAME_ID）
+void FDCAN_SendOLStatus(uint8_t evt);   // 发送开环动作状态反馈（命令 0x09 的响应帧，ID=FBK_OL_FRAME_ID）
 
 #endif

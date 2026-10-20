@@ -1,11 +1,12 @@
 #include "foc.h"
 #include "sense.h"
 #include "KTH7823.h"
-#include "encoder2.h"
+#include "kth7823_2.h"
 #include "arm_math.h"
 #include "Protect.h"
 #include "dbg_monitor.h"
-#include "motor_control.h"   
+#include "motor_control.h"
+#include "arm_math.h"
 
 void UartLog_FaultRecord(void);      // [TEST] 定义于 uart_cmd.c（故障记录入队）；删除本模块时一并删除本行
 void UartLog_RecoverBlocked(void);   // [TEST] 定义于 uart_cmd.c（恢复被挡诊断）；删除本模块时一并删除本行
@@ -38,6 +39,8 @@ volatile float   align_report_offset    = 0.0f; // 本次得到的零点偏移 (
 volatile float   align_report_delta     = 0.0f; // 本次测得的角度变化 (rad)
 volatile int8_t  align_report_direction = 1;    // 本次得到的方向 (+1/-1)
 volatile uint32_t align_report_samples  = 0;    // 本次窗口平均用到的样点数（诊断用）
+
+volatile uint8_t arrive_report_pending = 0;   // 转动到位事件：待主循环主动上报
 
 static uint32_t led_blink_tick = 0;    // LED 闪烁计时基准(ms)，进入 FAULT 时重置
 extern float control_dt;       // 控制周期 (秒)，由 motor_control.c 提供
@@ -76,8 +79,8 @@ static void align_accumulate(void)
     if (align_step_time == 0) return;                                        // 计时未启动
     if ((HAL_GetTick() - align_step_time) < (ALIGN_STEP_DELAY - ALIGN_AVG_MS)) return;
 
-    align_sum_sin += sinf(KTH7823_Angle_Rad);
-    align_sum_cos += cosf(KTH7823_Angle_Rad);
+    align_sum_sin += arm_sin_f32(KTH7823_Angle_Rad);
+    align_sum_cos += arm_cos_f32(KTH7823_Angle_Rad);
     align_sum_cnt++;
 }
 
@@ -193,8 +196,8 @@ void FOC_Clark(void)
 //Park 变换：静止坐标系 → 旋转坐标系
 void FOC_Park(void)
 {
-	float cos_theta = cosf(foc.angle);
-	float sin_theta = sinf(foc.angle);
+	float cos_theta = arm_cos_f32(foc.angle);
+	float sin_theta = arm_sin_f32(foc.angle);
 
 	foc.Id = foc.I_alpha * cos_theta + foc.I_beta * sin_theta;
 	foc.Iq = -foc.I_alpha * sin_theta + foc.I_beta * cos_theta;
@@ -203,8 +206,8 @@ void FOC_Park(void)
 //逆 Park 变换：旋转坐标系 → 静止坐标系
 void FOC_InversePark(void)
 {
-	float cos_theta = cosf(foc.angle);
-	float sin_theta = sinf(foc.angle);
+	float cos_theta = arm_cos_f32(foc.angle);
+	float sin_theta = arm_sin_f32(foc.angle);
 
 	foc.V_alpha = foc.Vd_norm * cos_theta - foc.Vq_norm * sin_theta;
 	foc.V_beta = foc.Vd_norm * sin_theta + foc.Vq_norm * cos_theta;
@@ -362,6 +365,7 @@ static void FOC_OpenLoopMoveHold_Service(void)
 				foc.openloop_hold           = 1;
 				foc.openloop_move_remain    = 0.0f;
 				foc.openloop_move_state     = FOC_OL_MOVE_HOLD;   // 无限期保持，由 v=0 / 切模式释放
+				arrive_report_pending    = 1;  // 置标志：主循环主动上报到位事件
 			} else if ((HAL_GetTick() - ol_move_t0) >= FOC_OL_MOVE_TIMEOUT_MS) {
 				// 运动超时（未转够）：不进入悬停，直接断电释放
 				FOC_OL_Release();
@@ -584,12 +588,7 @@ void FOC_Update(void)
 	// Clark 变换 
 	FOC_Clark();
 	
-	#if (FOC_CLOSEDLOOP_ENABLE == 0)	
-	if (foc.mode == FOC_STATE_SPEED || foc.mode == FOC_STATE_POSITION || foc.mode == FOC_STATE_TORQUE) {
-		FOC_SetMode(FOC_STATE_OPENLOOP);   // 经统一入口切回：重置 PID + 对齐开环角度/清零电压
-	}
-	#endif
-	
+	// 模式切换
 	switch (foc.mode) {
 		case FOC_STATE_IDLE:// 空闲模式：输出全部为零，PWM 占空比清零（真正停转，不悬空中点）
 			foc.Vd = 0.0f;
@@ -694,7 +693,7 @@ void FOC_Update(void)
 			mechanical_angle = (KTH7823_Angle_Multiturn - encoder_offset) * encoder_direction;
 			// 电角度 = 机械角度 × 极对数
 			foc.angle = mechanical_angle * MOTOR_POLE_PAIRS;
-			// 归一化到 [0, 2π)，避免大角度（多圈累积）造成 sinf/cosf 浮点精度损失
+			// 归一化到 [0, 2π)
 			foc.angle = fmodf(foc.angle, 2.0f * PI);
 			if (foc.angle < 0.0f) foc.angle += 2.0f * PI;
 			// Park变换（得到 Id, Iq）
@@ -836,6 +835,11 @@ void FOC_FaultRecoverProcess(void)
 // 切换 FOC 控制模式
 void FOC_SetMode(FOC_State_t mode)
 {
+	#if (FOC_CLOSEDLOOP_ENABLE == 0)	
+		if (mode == FOC_STATE_SPEED || mode == FOC_STATE_POSITION || mode == FOC_STATE_TORQUE) {
+			mode = FOC_STATE_OPENLOOP;   // 经统一入口切回：重置 PID + 对齐开环角度/清零电压
+		}
+	#endif
 	// 任意模式切换（含串口 mode=/ang=、CAN、启动序列）都退出开环保持
 	foc.openloop_hold = 0;
 	// 请求中止"开环运动/悬停"状态机

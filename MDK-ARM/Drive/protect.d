@@ -31,7 +31,7 @@ drive/protect.o: ..\Core\Src\Protect.c ..\Core\Inc\Protect.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_tim_ex.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
-  ..\Core\Inc\DRV8353.H ..\Core\Inc\KTH7823.h ..\Core\Inc\encoder2.h \
+  ..\Core\Inc\DRV8353.H ..\Core\Inc\KTH7823.h ..\Core\Inc\kth7823_2.h \
   ..\Core\Inc\sense.h ..\Core\Inc\tim.h ..\Core\Inc\main.h \
   ..\Core\Inc\foc.h ..\Core\Inc\pid.h \
   ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \

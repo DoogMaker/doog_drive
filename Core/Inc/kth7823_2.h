@@ -1,5 +1,5 @@
-#ifndef __ENCODER2_H
-#define __ENCODER2_H
+#ifndef __KTH7823_2_H
+#define __KTH7823_2_H
 
 #include "stm32g4xx_hal.h"
 #include <math.h>

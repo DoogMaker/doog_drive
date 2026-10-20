@@ -4,7 +4,7 @@
 #include "pid.h"
 #include "drv8353.h"      // DRV8353_Recover / DRV8353_Disable 等
 
-// 运行状态 LED 宏（全工程唯一定义处，motor_control.h 不再重复定义）
+// 运行状态 LED 宏
 // PB9 低电平点亮（共阳接法）：Run_ON=常亮，Run_OFF=熄灭，Run_Toggle=翻转
 #define Run_ON()     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET)
 #define Run_OFF()    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET)
@@ -91,6 +91,11 @@ typedef enum {
     FOC_OL_MOVE_HOLD,       // 已到位悬停保持（冻结电角度 + d 轴通电形成电弹簧）
     FOC_OL_MOVE_PULL        // 回拉中（偏差超出死区，低速反向回拉至滞环内）
 } FOC_OpenLoopMoveState_t;
+
+// 开环"转动到位"事件标志：1 = 有新的到位事件待上报
+// 由 20kHz 中断在 RUN→HOLD 转换时置位，主循环（FDCAN_App_Process）消费后清零，
+// 并主动发送一帧 0x300+NODE 状态帧（byte7=1 标识"到位事件"，区别于 0x09 查询响应的 byte7=0）
+extern volatile uint8_t arrive_report_pending;
 
 // 力矩模式最大 Iq 限幅（A）：取电机额定 14A
 //   原 45A 会算出 i_mag = √1.5×45 = 55A，既超 STALL_CURRENT_LIMIT(45A)，又正好顶到
